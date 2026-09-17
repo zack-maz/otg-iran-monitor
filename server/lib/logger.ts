@@ -27,6 +27,10 @@ const isProd = process.env.NODE_ENV === 'production';
  *        - req.headers.cookie            session cookies (sid=, etc.)
  *        - req.headers["x-api-key"]      upstream API keys forwarded to us
  *        - res.headers["set-cookie"]     outgoing session cookies
+ *        - req.headers["x-vercel-oidc-token"]       Vercel-injected project OIDC JWT
+ *        - req.headers["x-vercel-proxy-signature"]  Vercel edge→function proxy signature
+ *        - req.headers.forwarded                    carries the same proxy `sig=`
+ *      (The three Vercel headers were found unredacted in prod logs, 2026-09.)
  *
  *   2. Wildcard secret keys — match common upstream credential field names
  *      under any nested object. Adapter logs occasionally capture process.env
@@ -49,6 +53,9 @@ export const redactPaths: string[] = [
   'req.headers.cookie',
   'req.headers["x-api-key"]',
   'res.headers["set-cookie"]',
+  'req.headers["x-vercel-oidc-token"]',
+  'req.headers["x-vercel-proxy-signature"]',
+  'req.headers.forwarded',
   '*.UPSTASH_REDIS_REST_TOKEN',
   '*.OPENSKY_CLIENT_SECRET',
   '*.AISSTREAM_API_KEY',

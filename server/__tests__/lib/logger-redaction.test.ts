@@ -73,6 +73,25 @@ describe('Pino logger redaction', () => {
     expect(line).not.toContain('sk_live_xyz-api-key-value');
   });
 
+  it('redacts Vercel platform credential headers (OIDC token + proxy signature)', () => {
+    logger.info(
+      {
+        req: {
+          headers: {
+            'x-vercel-oidc-token': 'eyJ0eXAi.oidc-jwt-leak.sig',
+            'x-vercel-proxy-signature': 'Bearer proxy-signature-leak',
+            forwarded: 'for=1.2.3.4;host=example.app;proto=https;sig=forwarded-sig-leak;exp=1',
+          },
+        },
+      },
+      'incoming request',
+    );
+    const line = getLines()[0]!;
+    expect(line).not.toContain('oidc-jwt-leak');
+    expect(line).not.toContain('proxy-signature-leak');
+    expect(line).not.toContain('forwarded-sig-leak');
+  });
+
   it('redacts res.headers["set-cookie"]', () => {
     logger.info(
       {
