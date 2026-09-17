@@ -1,20 +1,13 @@
 // @vitest-environment node
 /**
- * Phase 35 D-01 — Redis-key registry drift gate.
+ * Redis-key registry drift gate.
  *
- * Parses the two markdown surfaces (CLAUDE.md §Serverless Cache + docs/architecture/redis-keys.md)
- * AND the codebase for Redis-key string literals, then asserts every documented key is
- * referenced in code and every code-referenced key is documented in BOTH surfaces (D-03
- * three-surface parity). Drift between any pair fails the next `vitest run`.
+ * Parses `docs/redis-keys.md` (the single key registry) AND the codebase for
+ * Redis-key string literals, then asserts every documented key is referenced in
+ * code and every code-referenced key is documented. Drift fails `vitest run`.
  *
- * Mirrors:
- *   - colorBridge.test.ts byte-identity sentinel pattern (parse two surfaces, assert parity)
- *   - actorCatalog.test.ts catalog-invariant pattern (per-entry assertions + orphan check)
- *   - urlLiveness.schema.test.ts schema-pinning pattern (literal contracts fail loud on drift)
- *
- * Why `// @vitest-environment node`: the default vitest env is `jsdom` (vite.config.ts:56),
- * but this test does fs walks across the repo. node env avoids loading jsdom for nothing
- * AND keeps `readdirSync` predictable on Darwin / Linux CI runners.
+ * Why `// @vitest-environment node`: the default vitest env is `jsdom`, but this
+ * test does fs walks across the repo.
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
@@ -28,8 +21,7 @@ const __dirname = dirname(__filename);
 
 // Three levels up from src/__tests__/lib/ → repo root.
 const REPO_ROOT = resolve(__dirname, '../../..');
-const CLAUDE_MD = resolve(REPO_ROOT, 'CLAUDE.md');
-const REDIS_KEYS_MD = resolve(REPO_ROOT, 'docs/architecture/redis-keys.md');
+const REDIS_KEYS_MD = resolve(REPO_ROOT, 'docs/redis-keys.md');
 
 /**
  * Phase 35 D-02 exemption list. Each entry MUST cite the surface (`file:line` or
@@ -44,6 +36,20 @@ const REDIS_KEYS_MD = resolve(REPO_ROOT, 'docs/architecture/redis-keys.md');
  *     AND from the code-key→documented direction.
  */
 const EXEMPT_KEYS: ReadonlyArray<{ key: string; reason: string }> = [
+  {
+    key: 'events:llm-pipeline-audit',
+    reason:
+      'retired key; survives only in code comments (redis.ts, llmEventExtractor.v3.ts, trendHistory.ts). No writer or reader.',
+  },
+  {
+    key: 'news:gdelt',
+    reason:
+      'retired key name; mentioned in a healthSources.ts comment explaining that readers now use `news:feed`.',
+  },
+  {
+    key: 'dashboard:auth-key',
+    reason: 'browser localStorage key in src/lib/dashboardAuth.ts, not a Redis key.',
+  },
   {
     key: 'events:llm:v2',
     reason:
@@ -77,11 +83,11 @@ const EXEMPT_KEYS: ReadonlyArray<{ key: string; reason: string }> = [
   {
     key: 'water:facilities',
     reason:
-      'transitional bare-prefix string in server/routes/water.ts (used as a redis-store debug probe in test fixtures); not the canonical key (`water:facilities:v4` is canonical per CLAUDE.md).',
+      'transitional bare-prefix string in server/routes/water.ts (used as a redis-store debug probe in test fixtures); not the canonical key (`water:facilities:v4` is canonical).',
   },
 ];
 
-/** Top-level Redis prefix families. Order matches CLAUDE.md / redis-keys.md ordering. */
+/** Top-level Redis prefix families. Order matches docs/redis-keys.md. */
 const KEY_PREFIX_FAMILIES: string[] = [
   'events:',
   'flights:',
@@ -90,11 +96,14 @@ const KEY_PREFIX_FAMILIES: string[] = [
   'water:',
   'news:',
   'markets:',
+  'weather:',
   'geocode:',
   'llm:',
   'cron:',
   'operator:',
   'audit:',
+  'dashboard:',
+  'ratelimit:',
 ];
 
 /**
@@ -106,7 +115,7 @@ const KEY_PREFIX_FAMILIES: string[] = [
  * adornments in historical docs; `{` `}` admit placeholder fragments.
  */
 const BACKTICK_KEY_RE =
-  /`((?:events|flights|ships|sites|water|news|markets|geocode|llm|cron|operator|audit):[a-zA-Z0-9:_{}.-]+)`/g;
+  /`((?:events|flights|ships|sites|water|news|markets|weather|geocode|llm|cron|operator|audit|dashboard|ratelimit):[a-zA-Z0-9:_{}.-]+)`/g;
 
 /**
  * Matches a Redis-key-shaped string literal in TS source:
@@ -118,7 +127,7 @@ const BACKTICK_KEY_RE =
  * both sides match on the prefix portion only.
  */
 const CODE_KEY_RE =
-  /['"`]((?:events|flights|ships|sites|water|news|markets|geocode|llm|cron|operator|audit):[a-zA-Z0-9:_-]*)/g;
+  /['"`]((?:events|flights|ships|sites|water|news|markets|weather|geocode|llm|cron|operator|audit|dashboard|ratelimit):[a-zA-Z0-9:_-]*)/g;
 
 /**
  * Strip placeholder fragments (`{...}` and `<...>`), collapse runs of `::` produced
@@ -139,7 +148,7 @@ function normaliseKey(raw: string): string {
 
 /**
  * Two normalised keys are "equivalent" if either is a prefix of the other (joined on
- * `:` boundaries). e.g. `flights` (umbrella in CLAUDE.md) matches `flights:opensky`
+ * `:` boundaries). e.g. a documented umbrella `flights` matches `flights:opensky`
  * (specific row in redis-keys.md); `cron:lastTick` matches `cron:lastTick:warm`.
  */
 function keysEquivalent(a: string, b: string): boolean {
@@ -157,16 +166,8 @@ function setHasEquivalent(haystack: ReadonlySet<string>, needle: string): boolea
 function extractKeysFromMarkdown(path: string): Set<string> {
   const src = readFileSync(path, 'utf-8');
 
-  // For CLAUDE.md, restrict scan to the §Serverless Cache subsection so unrelated
-  // backticked strings in other sections don't pollute the registry.
-  let scope = src;
-  if (path.endsWith('CLAUDE.md')) {
-    const after = src.split('## Serverless Cache')[1] ?? '';
-    scope = after.split('\n## ')[0] ?? '';
-  }
-
   const keys = new Set<string>();
-  for (const m of scope.matchAll(BACKTICK_KEY_RE)) {
+  for (const m of src.matchAll(BACKTICK_KEY_RE)) {
     const k = normaliseKey(m[1]);
     if (k.length > 0) keys.add(k);
   }
@@ -253,7 +254,6 @@ function extractKeysFromCode(): Map<string, Set<string>> {
 }
 
 // Module-level computations — run once for the whole suite.
-const claudeKeys = extractKeysFromMarkdown(CLAUDE_MD);
 const redisKeysDoc = extractKeysFromMarkdown(REDIS_KEYS_MD);
 const codeKeys = extractKeysFromCode();
 
@@ -273,12 +273,12 @@ function isExempt(codeKey: string): boolean {
   return EXEMPT_KEYS.some((e) => keysEquivalent(normCode, normaliseKey(e.key)));
 }
 
-describe('Phase 35 D-01 — Redis-key registry drift gate', () => {
+describe('Redis-key registry drift gate', () => {
   it('KEY_PREFIX_FAMILIES guard — regex stays in lockstep with documented families', () => {
     // Cheap sanity check so a future contributor who renames a family in the regex
     // also updates the list. Otherwise an entire family could silently fall out of
     // scope and the drift gate would pass on zero coverage.
-    expect(KEY_PREFIX_FAMILIES.length).toBe(12);
+    expect(KEY_PREFIX_FAMILIES.length).toBe(15);
     for (const fam of KEY_PREFIX_FAMILIES) {
       expect(BACKTICK_KEY_RE.source).toContain(fam.replace(':', ''));
       expect(CODE_KEY_RE.source).toContain(fam.replace(':', ''));
@@ -289,40 +289,12 @@ describe('Phase 35 D-01 — Redis-key registry drift gate', () => {
     // If the markdown parser returned an empty set, the it.each below would silently
     // pass on zero iterations. Phase 35 ships with ≥ 20 documented keys post-D-14 —
     // assert ≥ 10 to be safe.
-    expect(claudeKeys.size).toBeGreaterThanOrEqual(10);
+    expect(redisKeysDoc.size).toBeGreaterThanOrEqual(10);
     expect(redisKeysDoc.size).toBeGreaterThanOrEqual(10);
   });
 
-  describe('CLAUDE.md ↔ redis-keys.md surface parity (D-03)', () => {
-    it('every documented key in CLAUDE.md has an equivalent entry in redis-keys.md', () => {
-      // Equivalence is prefix-equivalence on `:` boundaries — `flights` (CLAUDE.md
-      // umbrella) is equivalent to `flights:opensky` (redis-keys.md specific row).
-      // This admits the deliberate-skim vs. deep-dive stylistic difference between
-      // the two surfaces while still failing loud on genuine drift.
-      const missing: string[] = [];
-      for (const k of claudeKeys) {
-        if (!setHasEquivalent(redisKeysDoc, k)) missing.push(k);
-      }
-      expect(
-        missing,
-        `Keys in CLAUDE.md §Serverless Cache without an equivalent in docs/architecture/redis-keys.md: ${missing.join(', ')}`,
-      ).toEqual([]);
-    });
-
-    it('every documented key in redis-keys.md has an equivalent entry in CLAUDE.md', () => {
-      const missing: string[] = [];
-      for (const k of redisKeysDoc) {
-        if (!setHasEquivalent(claudeKeys, k)) missing.push(k);
-      }
-      expect(
-        missing,
-        `Keys in docs/architecture/redis-keys.md without an equivalent in CLAUDE.md §Serverless Cache: ${missing.join(', ')}`,
-      ).toEqual([]);
-    });
-  });
-
   describe('documented-key → code reference (no orphans in docs)', () => {
-    it.each([...claudeKeys])('documented key %s has ≥1 code reference', (key) => {
+    it.each([...redisKeysDoc])('documented key %s has ≥1 code reference', (key) => {
       if (isExempt(key)) return;
       // Doc keys are already normalised (no `{}`). The code key may have a trailing
       // `:` from a template-literal prefix, so we accept either an exact match or a
@@ -341,7 +313,7 @@ describe('Phase 35 D-01 — Redis-key registry drift gate', () => {
 
   describe('code-key → documentation (no undocumented drift)', () => {
     it('every code key matches a documented key (or is exempt)', () => {
-      const documented = new Set([...claudeKeys, ...redisKeysDoc]);
+      const documented = redisKeysDoc;
       const orphans: Array<{ key: string; refs: string[] }> = [];
       for (const [codeKey, refs] of codeKeys) {
         if (isExempt(codeKey)) continue;
@@ -357,7 +329,7 @@ describe('Phase 35 D-01 — Redis-key registry drift gate', () => {
           .map((o) => `  - '${o.key}' (first refs: ${o.refs.join(', ')})`)
           .join('\n');
         expect.fail(
-          `Found ${orphans.length} code key(s) not documented in CLAUDE.md §Serverless Cache nor docs/architecture/redis-keys.md (and not in EXEMPT_KEYS):\n${detail}`,
+          `Found ${orphans.length} code key(s) not documented in docs/redis-keys.md (and not in EXEMPT_KEYS):\n${detail}`,
         );
       }
     });
