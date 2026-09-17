@@ -53,10 +53,7 @@ const N = 30;
 const GAP_MS = 100;
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 
-const OUT_DIR = resolve(
-  __dirname,
-  '../.planning/phases/30.1-cascade-fallback-fix-re-enable-openrouter-or-document-single',
-);
+const OUT_DIR = resolve(__dirname, '../.snapshots');
 const OUT_PATH = resolve(OUT_DIR, '30.1-or-pulse-snapshot.json');
 const TMP_PATH = resolve(OUT_DIR, '30.1-or-pulse-snapshot.json.tmp');
 

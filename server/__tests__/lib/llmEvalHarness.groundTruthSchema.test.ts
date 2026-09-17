@@ -1,7 +1,7 @@
 // @vitest-environment node
 /**
  * Phase 33 Plan 33-05 Task 1 (RED) — fixture-shape contract for
- * `.planning/eval/ground-truth-events.json` after the D-14 backfill.
+ * `server/data/eval/ground-truth-events.json` after the D-14 backfill.
  *
  * Pattern: real on-disk JSON read, mirroring
  * `server/__tests__/lib/llmEvalHarness.adversarial.test.ts:77-90` (the
@@ -26,7 +26,7 @@ import { resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 
 describe('ground-truth-events.json D-14 expectedActor backfill', () => {
-  const fixturePath = resolve(__dirname, '../../../.planning/eval/ground-truth-events.json');
+  const fixturePath = resolve(__dirname, '../../data/eval/ground-truth-events.json');
   const raw = readFileSync(fixturePath, 'utf-8');
   const file = JSON.parse(raw) as {
     version: number;

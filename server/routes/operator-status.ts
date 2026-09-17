@@ -77,7 +77,7 @@ const LIMIT_DRILL_DOWN = 20;
  * actor strings.
  *
  * PATTERNS critical risk #3 — the full codebook lives at
- * `.planning/phases/33-actor-metadata-audit-canonical-catalog-eval-expansion/cameo-codes.json`
+ * `src/__tests__/fixtures/cameo-codes.json`
  * (Plan 33-02). That file is NOT bundled into the Vercel server build artifact,
  * so the route cannot read it at runtime. This subset covers the country-
  * military + class codes most likely to surface as raw CAMEO actors in

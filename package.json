@@ -10,7 +10,7 @@
     "dev": "concurrently -n client,server -c blue,green \"npm:dev:client\" \"npm:dev:server\"",
     "dev:client": "vite",
     "dev:server": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx/esm --watch server/index.ts",
-    "build": "vite build && tsup server/vercel-entry.ts --format esm --out-dir api --no-splitting --tsconfig tsconfig.server.json && mkdir -p api/_eval && cp .planning/eval/ground-truth-events.json .planning/eval/adversarial-injections.json api/_eval/",
+    "build": "vite build && tsup server/vercel-entry.ts --format esm --out-dir api --no-splitting --tsconfig tsconfig.server.json && mkdir -p api/_eval && cp server/data/eval/ground-truth-events.json server/data/eval/adversarial-injections.json api/_eval/",
     "typecheck": "tsc -b && type-coverage",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

@@ -75,8 +75,8 @@ describe('runAdversarialEval — Phase 28.2 Plan 03 Task 5 / B-2', () => {
   });
 
   // Test 1 — fixture file shape verification (real on-disk read)
-  it('fixture file at .planning/eval/adversarial-injections.json has >=10 entries spanning 5 categories', () => {
-    const path = resolve(__dirname, '../../../.planning/eval/adversarial-injections.json');
+  it('fixture file at server/data/eval/adversarial-injections.json has >=10 entries spanning 5 categories', () => {
+    const path = resolve(__dirname, '../../data/eval/adversarial-injections.json');
     const raw = readFileSync(path, 'utf-8');
     const fixture = JSON.parse(raw);
     expect(Array.isArray(fixture.entries)).toBe(true);
@@ -230,7 +230,7 @@ describe('runAdversarialEval — Phase 28.2 Plan 03 Task 5 / B-2', () => {
 
 describe('Phase 33 adversarial — actor-confusion injections (D-15)', () => {
   // Single FS read shared across all it.each branches.
-  const fixturePath = resolve(__dirname, '../../../.planning/eval/adversarial-injections.json');
+  const fixturePath = resolve(__dirname, '../../data/eval/adversarial-injections.json');
   const fixture = JSON.parse(readFileSync(fixturePath, 'utf-8')) as {
     entries: Array<{ id: string; category: string }>;
   };

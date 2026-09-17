@@ -30,7 +30,7 @@ import { batchResponseV3, EVENT_EXTRACTION_SCHEMA_V3 } from '../server/lib/llmSc
 import type { LocationHierarchyV2 } from '../server/lib/llmSchema.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const GT_PATH = resolve(__dirname, '../.planning/eval/ground-truth-events.json');
+const GT_PATH = resolve(__dirname, '../server/data/eval/ground-truth-events.json');
 const RESULTS_PATH = '/tmp/27.4.3-03-bakeoff-direct-results.jsonl';
 
 interface GTEvent {

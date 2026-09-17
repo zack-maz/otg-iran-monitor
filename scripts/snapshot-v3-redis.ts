@@ -42,10 +42,7 @@ import { fileURLToPath } from 'node:url';
 import { redis } from '../server/cache/redis.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PHASE_DIR = resolve(
-  __dirname,
-  '../.planning/phases/27.4.4-v3-latency-remediation-and-cutover',
-);
+const PHASE_DIR = resolve(__dirname, '../.snapshots');
 
 interface SnapshotPayload {
   label: string;

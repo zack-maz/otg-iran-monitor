@@ -16,7 +16,7 @@
  *     D-16, optional)
  *
  * CAMEO codes cross-reference the committed snapshot at
- *   .planning/phases/33-actor-metadata-audit-canonical-catalog-eval-expansion/cameo-codes.json
+ *   src/__tests__/fixtures/cameo-codes.json
  * Orphan codes (cameoCodes[] entries not present in that snapshot) fail
  * the contract test loudly. If GDELT renames an actor code upstream, the
  * mismatch surfaces on the next vitest run — no auto-resync (see
