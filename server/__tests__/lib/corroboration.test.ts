@@ -8,7 +8,7 @@ import type { ConflictEventEntity, NewsArticle, NewsCluster } from '../../types.
  *
  * Generalizes the Phase-22 Bellingcat three-gate (temporal AND geographic AND
  * keyword) from Bellingcat-specific to ANY tier-1/2 OSINT source in
- * `news:gdelt`. A boost is granted ONLY on a genuine 3-gate match; coincidental
+ * `news:feed`. A boost is granted ONLY on a genuine 3-gate match; coincidental
  * same-city-same-day matches (only 1-2 gates pass) are withheld.
  *
  * The keyword gate is STRICT: an actor or specific-action token must match,

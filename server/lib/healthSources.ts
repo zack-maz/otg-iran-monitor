@@ -10,9 +10,7 @@
  * module.
  *
  * W1 audit drift fixes baked in (see 28.1-W1-AUDIT.md):
- *   - DRIFT-1: news → 'news:feed' (route writer; 'news:gdelt' was the LLM
- *              extractor's NEWS-context side-input, never the canonical
- *              freshness witness for /api/news).
+ *   - DRIFT-1: news → 'news:feed' (the route's writer key).
  *   - DRIFT-2: sites → 'sites:v3' (post Phase-27.3.1 envelope shape; the
  *              prior 'sites:v2' is unread/dead).
  *   - DRIFT-3: water → 'water:facilities:v4' (post Phase-42 name-aware dedup
@@ -36,8 +34,9 @@ export const SOURCE_KEYS: Record<string, string> = {
   flights: 'flights:adsblol',
   ships: 'ships:ais',
   events: 'events:gdelt',
-  // DRIFT-1: route writer is news:feed. The legacy 'news:gdelt' is the LLM
-  // extractor side-input, never updated by the news route.
+  // The news route writes `news:feed`; it is also the LLM extractor's and the
+  // corroboration scorer's news side-input. (Those readers pointed at a legacy
+  // `news:gdelt` key that nothing wrote until 2026-09.)
   news: 'news:feed',
   markets: 'markets:yahoo:1d',
   weather: 'weather:open-meteo',

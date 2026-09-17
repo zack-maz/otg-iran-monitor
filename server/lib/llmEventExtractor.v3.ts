@@ -110,7 +110,7 @@ const TEMPORAL_CONTEXT_WINDOW_MS = 72 * 3_600_000;
 /** RESEARCH.md Open Q A4 — ±24h window for news match (no haversine, only time). */
 const NEWS_MATCH_WINDOW_MS = 24 * 3_600_000;
 /** Redis keys read by the context builder. */
-const NEWS_KEY = 'news:gdelt';
+const NEWS_KEY = 'news:feed';
 /**
  * Terminal cache of ConflictEventEntity[] — written by server/routes/events.ts
  * after geocoding completes. Read here only for the TEMPORAL CONTEXT BLOCK

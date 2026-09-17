@@ -574,14 +574,14 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
           log.warn({ err: evalErr }, 'eval harness threw; continuing pipeline');
         }
 
-        // GDELT-MATCH-03/04 — read the OSINT clusters (`news:gdelt`) so the
+        // GDELT-MATCH-03/04 — read the OSINT clusters (`news:feed`) so the
         // strict three-gate corroboration boost can be folded into each
         // entity's additive compositeScore. Best-effort: a missing/failed read
         // simply yields a tier+precision composite with zero corroboration —
         // never blocks the write, never mutates the raw corpus (D-07).
         let newsClusters: NewsCluster[] | undefined;
         try {
-          const newsCache = await cacheGetSafe<NewsCluster[]>('news:gdelt', 0);
+          const newsCache = await cacheGetSafe<NewsCluster[]>('news:feed', 0);
           if (newsCache?.data) newsClusters = newsCache.data;
         } catch {
           /* best-effort — corroboration boost defaults to 0 */
@@ -707,7 +707,7 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
 export function enrichedV3ToEntities(
   geocoded: GeocodedEnrichedEventV3[],
   groups: Array<{ key: string; entities: ConflictEventEntity[]; sourceUrls: string[] }>,
-  // GDELT-MATCH-03/04 — optional OSINT clusters (`news:gdelt`) for the strict
+  // GDELT-MATCH-03/04 — optional OSINT clusters (`news:feed`) for the strict
   // three-gate corroboration boost folded into compositeScore. Omitted callers
   // (legacy / tests) get a tier+precision composite with zero corroboration.
   newsClusters?: NewsCluster[],

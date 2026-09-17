@@ -99,7 +99,7 @@ export async function refreshRawEvents(opts: RefreshRawEventsOpts): Promise<Conf
     lng?: number;
   }[] = [];
   try {
-    const newsCache = await cacheGetSafe<NewsCluster[]>('news:gdelt', 0);
+    const newsCache = await cacheGetSafe<NewsCluster[]>('news:feed', 0);
     if (newsCache?.data) {
       bellingcatArticles = newsCache.data
         .flatMap((cluster) => cluster.articles)
