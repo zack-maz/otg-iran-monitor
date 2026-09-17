@@ -131,9 +131,9 @@ state.
   with safe wrappers and the timeout helper.
 - [`server/__tests__/resilience/redis-death.test.ts`](../../server/__tests__/resilience/redis-death.test.ts) —
   chaos test proving the degraded path.
-- [`docs/architecture/deployment.md`](../architecture/deployment.md) —
+- `docs/architecture/deployment.md` —
   cache tier in the Vercel topology diagram.
-- [`docs/degradation.md`](../degradation.md) — graceful degradation
+- `docs/degradation.md` — graceful degradation
   contract including the cache layer fallback.
 - Phase 13 CONTEXT and SUMMARY (`.planning/phases/13-serverless-cache/`)
   for the original migration.

@@ -36,7 +36,7 @@
     "type-coverage": "type-coverage",
     "preview": "vite preview",
     "openapi:lint": "redocly lint server/openapi.yaml --format=stylish",
-    "docs:lint": "markdown-link-check --quiet --config .markdown-link-check.json README.md && find docs -name '*.md' -not -path '*/brainstorms/*' -not -path '*/superpowers/*' -print0 | xargs -0 -n1 markdown-link-check --quiet --config .markdown-link-check.json",
+    "docs:lint": "markdown-link-check --quiet --config .markdown-link-check.json README.md CLAUDE.md && find docs -name '*.md' -not -path '*/portfolio/*' -print0 | xargs -0 -n1 markdown-link-check --quiet --config .markdown-link-check.json",
     "prepare": "husky"
   },
   "typeCoverage": {

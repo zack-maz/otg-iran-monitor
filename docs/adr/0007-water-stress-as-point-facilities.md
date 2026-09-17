@@ -136,7 +136,7 @@ Concretely:
   split (12 core countries must succeed, 11 extended are
   best-effort) plus a 30-second route-level timeout that returns
   an empty array with `stale: true` rather than 500 on Overpass
-  failure. See [`docs/runbook.md`](../runbook.md) "Overpass API
+  failure. See `docs/runbook.md` "Overpass API
   timeout" for the operational contract.
 - **Gulf region coverage is incomplete.** A Phase 26.1 desalination
   audit found major Gulf desalination plants missing from
@@ -158,7 +158,7 @@ Concretely:
   anomalies update more frequently) are separate Redis keys. See
   [`server/routes/water.ts`](../../server/routes/water.ts) and the
   Water data flow in
-  [`docs/architecture/data-flows.md`](../architecture/data-flows.md).
+  `docs/architecture/data-flows.md`.
 
 ## Alternatives Considered
 
@@ -204,7 +204,7 @@ Concretely:
 - [`src/components/detail/WaterFacilityDetail.tsx`](../../src/components/detail/WaterFacilityDetail.tsx) —
   detail panel with all Aqueduct indicators, precipitation, attack
   status.
-- [`docs/architecture/data-flows.md`](../architecture/data-flows.md) —
+- `docs/architecture/data-flows.md` —
   water data flow sequence diagram.
 - Phase 26 and 26.1 CONTEXT / SUMMARY
   (`.planning/phases/26-water-stress-layer/`,

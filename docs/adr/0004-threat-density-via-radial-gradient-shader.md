@@ -152,10 +152,10 @@ Additional tuning:
   the extension itself.
 - [`src/components/map/layers/ThreatHeatmapOverlay.tsx`](../../src/components/map/layers/ThreatHeatmapOverlay.tsx) —
   the threat cluster layer using the extension.
-- [`src/lib/threatWeight.ts`](../../src/lib/threatWeight.ts) — the
+- [`src/components/map/layers/ThreatHeatmapOverlay.tsx`](../../src/components/map/layers/ThreatHeatmapOverlay.tsx) (`computeThreatWeight`; the standalone `threatWeight.ts` module no longer exists) — the
   `computeThreatWeight` formula (type weight × log mentions × log
   sources × fatality factor × Goldstein hostility).
-- [`docs/architecture/ontology/algorithms.md`](../architecture/ontology/algorithms.md) —
+- `docs/architecture/ontology/algorithms.md` —
   BFS clustering algorithm rationale.
 - Phase 23 and 23.2 CONTEXT / SUMMARY
   (`.planning/phases/23-threat-density-improvements/`,

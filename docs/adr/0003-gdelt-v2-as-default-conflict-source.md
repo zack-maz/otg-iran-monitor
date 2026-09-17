@@ -109,7 +109,7 @@ Concretely:
   pauses during holidays and maintenance. The backfill path and the
   serve-stale-on-failure contract keep the app serving data, but the
   freshness can lag by hours during outages. Documented in
-  [`docs/runbook.md`](../runbook.md).
+  `docs/runbook.md`.
 
 ### Neutral
 
@@ -120,7 +120,7 @@ Concretely:
   `classifyByBaseCode`, `CITY_CENTROIDS`, and FIPS 10-4 country code
   tables are hand-maintained as `TODO(26.2)` tech debt, awaiting a
   proper GDELT redo phase. These are documented in the architecture
-  diagrams ([`docs/architecture/data-flows.md`](../architecture/data-flows.md))
+  diagrams (`docs/architecture/data-flows.md`)
   with inline labels so reviewers can see them as known debt rather
   than hidden warts.
 
@@ -152,7 +152,7 @@ Concretely:
   preserved ACLED adapter (unwired).
 - [`server/routes/events.ts`](../../server/routes/events.ts) — the
   route handler, cache wiring, and backfill cooldown.
-- [`docs/architecture/data-flows.md`](../architecture/data-flows.md) —
+- `docs/architecture/data-flows.md` —
   events data flow sequence diagram.
 - [ADR-0005](./0005-phase-26-2-nlp-approach-scrapped.md) — the
   post-mortem on the attempted NLP mitigation.

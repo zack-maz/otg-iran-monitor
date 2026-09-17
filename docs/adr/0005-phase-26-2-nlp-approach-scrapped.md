@@ -20,7 +20,7 @@ geolocation is inherently noisy for the Iran conflict region — intact.
 
 See [ADR-0003](./0003-gdelt-v2-as-default-conflict-source.md) for why
 GDELT is the default source despite these issues and
-[`.planning/phases/26.2-conflict-geolocation-improvement/26.2-CONTEXT.md`](../../.planning/phases/26.2-conflict-geolocation-improvement/26.2-CONTEXT.md)
+`.planning/phases/26.2-conflict-geolocation-improvement/26.2-CONTEXT.md`
 for the original problem framing that motivated Phase 26.2.
 
 Phase 26.2 ("Conflict Geolocation Improvement") attempted to solve
@@ -83,7 +83,7 @@ Concrete revert actions taken in Phase 26.3:
   `CAMEO_TO_FIPS` table, the pre-26.2 FIPS lookup, the Phase 22.1
   dispersion algorithm. These are now all labeled `TODO(26.2)` tech
   debt in the code and in
-  [`docs/architecture/data-flows.md`](../architecture/data-flows.md)
+  `docs/architecture/data-flows.md`
   awaiting the redo.
 - **Time invested before scrap:** roughly two weeks of planning,
   implementation, and debugging across 3 plans (Phase 26.2 Plans
@@ -123,7 +123,7 @@ Concrete revert actions taken in Phase 26.3:
 - **The tech debt is documented, not hidden.** The `TODO(26.2)`
   markers in `server/lib/geoValidation.ts`, the CAMEO tables, and
   the architecture diagrams
-  ([`docs/architecture/data-flows.md`](../architecture/data-flows.md))
+  (`docs/architecture/data-flows.md`)
   all point to the known problem. Anyone reading the project today
   sees "this is tech debt we know about" rather than "why is this so
   hacky?"
@@ -139,7 +139,7 @@ Concrete revert actions taken in Phase 26.3:
   depends on Phase 26.4 (this phase) completing first. Phase 26.2
   was originally inserted as URGENT between Phase 26 and Phase 26.3;
   now it is deferred indefinitely. See
-  [STATE.md "Roadmap Evolution"](../../.planning/STATE.md) for the
+  STATE.md "Roadmap Evolution" for the
   chronology.
 - **Users of the live demo see the same stacking artifacts that
   Phase 22.1 dispersion partially masked.** Phase 26.2's centroid
@@ -276,11 +276,11 @@ slot in the roadmap, not a thing you do "when there's time."
 
 ## References
 
-- [`.planning/phases/26.2-conflict-geolocation-improvement/26.2-CONTEXT.md`](../../.planning/phases/26.2-conflict-geolocation-improvement/26.2-CONTEXT.md) —
+- `.planning/phases/26.2-conflict-geolocation-improvement/26.2-CONTEXT.md` —
   original Phase 26.2 problem framing and implementation plan.
-- [`.planning/phases/26.3-production-code-cleanup/26.3-CONTEXT.md`](../../.planning/phases/26.3-production-code-cleanup/26.3-CONTEXT.md) —
+- `.planning/phases/26.3-production-code-cleanup/26.3-CONTEXT.md` —
   cleanup phase that absorbed the revert.
-- [`.planning/STATE.md`](../../.planning/STATE.md) — "Roadmap
+- `.planning/STATE.md` — "Roadmap
   Evolution" section records the scrap as a first-class project
   event: _"Phase 26.2 SCRAPPED and deferred — NLP approach was
   wrong, patching bad geocoding with more code didn't work."_
@@ -289,7 +289,7 @@ slot in the roadmap, not a thing you do "when there's time."
 - [`server/adapters/gdelt.ts`](../../server/adapters/gdelt.ts) —
   `classifyByBaseCode` and the pre-26.2 synchronous
   `parseAndFilter` that was restored.
-- [`docs/architecture/data-flows.md`](../architecture/data-flows.md) —
+- `docs/architecture/data-flows.md` —
   events data flow with inline `TODO(26.2)` labels.
 - [README "What I Learned / What I'd Do Differently"](../../README.md) —
   public-facing short version of this retrospective. This ADR is the
