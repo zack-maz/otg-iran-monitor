@@ -74,6 +74,12 @@ export interface RefreshRawEventsOpts {
   cached: { data: ConflictEventEntity[] } | null;
   /** Force a WAR_START backfill regardless of cooldown (`?backfill=true`). */
   forceBackfill?: boolean;
+  /**
+   * Never backfill, even on an empty accumulator. The cron sets this: the
+   * backfill is hundreds of sequential GDELT zip downloads and must not eat the
+   * extraction run's 800s function budget. The route backfills on the next visit.
+   */
+  skipBackfill?: boolean;
 }
 
 /**
@@ -82,7 +88,7 @@ export interface RefreshRawEventsOpts {
  * callers own the fallback (stale cache for the route, skip for the cron).
  */
 export async function refreshRawEvents(opts: RefreshRawEventsOpts): Promise<ConflictEventEntity[]> {
-  const { cached, forceBackfill = false } = opts;
+  const { cached, forceBackfill = false, skipBackfill = false } = opts;
 
   // Extract Bellingcat articles from news cache for corroboration boost (opportunistic)
   let bellingcatArticles: {
@@ -121,7 +127,7 @@ export async function refreshRawEvents(opts: RefreshRawEventsOpts): Promise<Conf
   }
 
   // Lazy backfill: seed historical events when cache is empty or forced
-  if ((!cached || forceBackfill) && (forceBackfill || (await shouldBackfill()))) {
+  if (!skipBackfill && (!cached || forceBackfill) && (forceBackfill || (await shouldBackfill()))) {
     try {
       const backfillDays = Math.ceil((Date.now() - WAR_START) / 86_400_000);
       const backfillData = await backfillEvents(backfillDays);

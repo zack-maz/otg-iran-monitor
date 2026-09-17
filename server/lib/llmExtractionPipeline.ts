@@ -296,7 +296,7 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
   let merged: ConflictEventEntity[] = rawCached?.data ?? [];
   if (merged.length === 0 || rawCached?.stale) {
     try {
-      merged = await refreshRawEvents({ cached: rawCached });
+      merged = await refreshRawEvents({ cached: rawCached, skipBackfill: true });
       log.info({ count: merged.length }, 'cron: refreshed raw GDELT cache before extraction');
     } catch (err) {
       // GDELT down → fall back to whatever (stale) raw rows we already had.

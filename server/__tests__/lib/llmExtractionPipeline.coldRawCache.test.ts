@@ -63,7 +63,8 @@ describe('runRefreshExtraction — raw GDELT input', () => {
 
     const result = await runRefreshExtraction({ triggeredBy: 'cron' });
 
-    expect(refreshRawEventsMock).toHaveBeenCalledWith({ cached: null });
+    // skipBackfill: the WAR_START backfill must never run inside the cron's 800s budget.
+    expect(refreshRawEventsMock).toHaveBeenCalledWith({ cached: null, skipBackfill: true });
     expect(result.reason).toBe('pipeline_busy'); // i.e. NOT no_raw_events
   });
 

@@ -89,6 +89,18 @@ describe('refreshRawEvents', () => {
     expect(merged.map((e) => e.id).sort()).toEqual(['h', 'x']);
   });
 
+  it('never backfills when skipBackfill is set, even on an empty accumulator', async () => {
+    const { redis } = await import('../../cache/redis.js');
+    vi.mocked(redis.get).mockResolvedValueOnce(null); // cooldown elapsed → would backfill
+    const { refreshRawEvents } = await import('../../lib/rawEventsRefresh.js');
+    fetchEventsMock.mockResolvedValue([makeEvent('a')]);
+
+    const merged = await refreshRawEvents({ cached: null, skipBackfill: true });
+
+    expect(backfillEventsMock).not.toHaveBeenCalled();
+    expect(merged.map((e) => e.id)).toEqual(['a']);
+  });
+
   it('propagates a GDELT fetch failure without writing the cache', async () => {
     const { refreshRawEvents } = await import('../../lib/rawEventsRefresh.js');
     fetchEventsMock.mockRejectedValue(new Error('gdelt down'));
