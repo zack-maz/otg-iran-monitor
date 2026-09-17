@@ -406,6 +406,25 @@ describe('Events Route (Redis accumulator)', () => {
     expect(mockFetchEvents).not.toHaveBeenCalled();
   });
 
+  it('does not refetch GDELT on a fresh raw cache when the LLM is configured but its cache is cold', async () => {
+    // Regression (2026-09): the fresh-cache gate also required `!isLLMConfigured()`,
+    // so in prod (LLM configured, events:llm:v3 cold) EVERY request re-downloaded
+    // GDELT and rewrote the ~700KB accumulator.
+    mockIsLLMConfigured.mockReturnValue(true);
+    redisStore.set('events:gdelt', {
+      data: [eventA],
+      fetchedAt: Date.now(), // fresh
+    });
+
+    const res = await fetch(`${baseUrl}/api/events`);
+    const body = await res.json();
+
+    expect(res.ok).toBe(true);
+    expect(body.stale).toBe(false);
+    expect(body.data[0].id).toBe('gdelt-A');
+    expect(mockFetchEvents).not.toHaveBeenCalled();
+  });
+
   it('calls fetchEvents on cache miss and returns merged result', async () => {
     mockFetchEvents.mockResolvedValue([eventA, eventB]);
 
