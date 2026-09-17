@@ -168,7 +168,13 @@ export async function refreshRawEvents(opts: RefreshRawEventsOpts): Promise<Conf
 
   // Store raw (undispersed) coordinates — dispersion is applied client-side
   // in useFilteredEntities so it dynamically adjusts when filters change.
-  await cacheSetSafe(EVENTS_KEY, merged, EVENTS_REDIS_TTL_SEC);
+  //
+  // Exception: a backfill-less refresh of an EMPTY accumulator (the cron on a
+  // cold cache) is not persisted. Writing it would make the key non-empty, and
+  // the route only backfills history when it finds the accumulator empty.
+  if (!(skipBackfill && !cached)) {
+    await cacheSetSafe(EVENTS_KEY, merged, EVENTS_REDIS_TTL_SEC);
+  }
 
   return merged;
 }

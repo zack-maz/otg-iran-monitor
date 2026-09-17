@@ -99,6 +99,17 @@ describe('refreshRawEvents', () => {
 
     expect(backfillEventsMock).not.toHaveBeenCalled();
     expect(merged.map((e) => e.id)).toEqual(['a']);
+    // Not persisted: the route must still find the accumulator empty and backfill.
+    expect(cacheSetSpy).not.toHaveBeenCalled();
+  });
+
+  it('persists a skipBackfill refresh when merging into an existing accumulator', async () => {
+    const { refreshRawEvents } = await import('../../lib/rawEventsRefresh.js');
+    fetchEventsMock.mockResolvedValue([makeEvent('b')]);
+
+    await refreshRawEvents({ cached: { data: [makeEvent('a')] }, skipBackfill: true });
+
+    expect(cacheSetSpy).toHaveBeenCalledTimes(1);
   });
 
   it('propagates a GDELT fetch failure without writing the cache', async () => {
