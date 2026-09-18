@@ -4,7 +4,7 @@
  *
  * For each candidate model:
  *   1. Iterate through the 50-event ground-truth corpus
- *      (.planning/eval/ground-truth-events.json).
+ *      (server/data/eval/ground-truth-events.json).
  *   2. For each GT event, build a synthetic GDELT-shaped user prompt seeded
  *      from the event description and invoke freeClaudeRouter.callLLM with
  *      `modelOverride: <candidate>` so the cascade routes to NVIDIA NIM.
@@ -40,7 +40,7 @@ import { batchResponseV3, EVENT_EXTRACTION_SCHEMA_V3 } from '../server/lib/llmSc
 import type { LocationHierarchyV2 } from '../server/lib/llmSchema.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const GT_PATH = resolve(__dirname, '../.planning/eval/ground-truth-events.json');
+const GT_PATH = resolve(__dirname, '../server/data/eval/ground-truth-events.json');
 const RESULTS_PATH = '/tmp/27.4.3-03-bakeoff-results.jsonl';
 
 interface GTEvent {

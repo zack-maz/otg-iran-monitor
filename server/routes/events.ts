@@ -1,13 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
-import { fetchEvents, backfillEvents } from '../adapters/gdelt.js';
-import { isLLMConfigured } from '../adapters/llm-provider.js';
 import { loadDevLLMCacheV2 } from '../cache/devFileCache.js';
 import { cacheGetSafe, cacheSetSafe, redis } from '../cache/redis.js';
 import { WAR_START, CACHE_TTL } from '../config.js';
 import { groupGdeltRows } from '../lib/eventGrouping.js';
-import { extractBellingcatGeo } from '../lib/eventScoring.js';
 // Phase 39 Plan 04 OBS-FLIGHT-03/06 — the Bearer-gated /llm-history read
 // surface consumes both flight-recorder list modules + their cold-start
 // hydration helpers (repopulate the in-memory singleton after a Fluid Compute
@@ -32,6 +29,7 @@ import { appendOperatorAuditEntry, bearerFingerprint } from '../lib/operatorAudi
 // quota guardrails on the dashboardAuth-gated /llm-pipeline + /llm-replay
 // endpoints. Both helpers degrade open on Redis failure (logged, not thrown).
 import { checkPruneQuota } from '../lib/pruneQuota.js';
+import { EVENTS_KEY, refreshRawEvents } from '../lib/rawEventsRefresh.js';
 import { computeCompositeScore } from '../lib/relevanceScorer.js';
 import { checkReplayQuota } from '../lib/replayQuota.js';
 import { sanitizeError } from '../lib/sanitizeError.js';
@@ -39,7 +37,6 @@ import { sanitizeError } from '../lib/sanitizeError.js';
 // share one helper. The route is the Bearer-gated entry point for the
 // dashboard click (Plan 32-05) AND the cron post-step (Plan 32-03 Task 3,
 // which calls the helper DIRECTLY per RESEARCH A4 — no self-HTTP).
-import { extractDomain, getSourceTier } from '../lib/sourceTiers.js';
 import { pruneDeadUrlEvents } from '../lib/urlLiveness.js';
 // Phase 27.4.6 — entity adapters live with the cron-driven extraction
 // helper. The legacy `enrichedToEntities` alias re-exported from this file
@@ -52,7 +49,7 @@ import { eventsResponseSchema } from '../schemas/cacheResponse.js';
 
 import type { LLMRunSummary } from '../lib/llmProgress.js';
 import type { GeocodeProvenance } from '../lib/llmSchema.js';
-import type { ConflictEventEntity, NewsCluster } from '../types.js';
+import type { ConflictEventEntity } from '../types.js';
 
 /** Zod schema for /api/events query params */
 
@@ -65,20 +62,8 @@ const eventsQuerySchema = z.object({
     .transform((v) => v === 'true'),
 });
 
-/** Redis key for accumulated GDELT events */
-const EVENTS_KEY = 'events:gdelt';
-
 /** Logical TTL in ms -- used to compute staleness (15 minutes) */
 const LOGICAL_TTL_MS = CACHE_TTL.events;
-
-/** Hard Redis TTL in seconds -- 10x logical TTL (2.5 hours) for stale-but-servable data */
-const REDIS_TTL_SEC = 9000;
-
-/** Redis key storing last backfill Unix ms timestamp */
-const BACKFILL_KEY = 'events:backfill-ts';
-
-/** 1 hour cooldown to prevent hammering GDELT master list */
-const BACKFILL_COOLDOWN_MS = 3_600_000;
 
 /** Redis key for LLM-enriched events (separate from raw GDELT).
  *  Phase 29 D-02 part C — collapsed to v3-only; v1 + v2 keys retired. */
@@ -221,39 +206,6 @@ async function loadRecentEnrichedEvents(limit: number): Promise<RecentEnrichedEv
       });
   } catch {
     return [];
-  }
-}
-
-/**
- * Check whether a backfill should run.
- * Returns true if never backfilled or cooldown has expired.
- *
- * Resilient to Redis death: if the redis client throws (e.g. Upstash REST is
- * down), we allow the backfill attempt rather than crashing the request. The
- * backfill itself is wrapped in its own try/catch by the caller, so a
- * subsequent redis.set failure is also non-fatal.
- */
-async function shouldBackfill(): Promise<boolean> {
-  try {
-    const lastTs = await redis.get<number>(BACKFILL_KEY);
-    if (lastTs === null || lastTs === undefined) return true;
-    return Date.now() - lastTs > BACKFILL_COOLDOWN_MS;
-  } catch {
-    // Redis unreachable -- allow backfill, it has its own error handling
-    return true;
-  }
-}
-
-/**
- * Persist the backfill timestamp without throwing on Redis failure.
- * Best-effort: if Redis is dead, the next request will simply re-attempt
- * the backfill (rate-limited by GDELT itself, not catastrophic).
- */
-async function recordBackfillTimestamp(): Promise<void> {
-  try {
-    await redis.set(BACKFILL_KEY, Date.now(), { ex: REDIS_TTL_SEC });
-  } catch {
-    // Swallow: cooldown tracking is non-critical
   }
 }
 
@@ -767,90 +719,23 @@ eventsRouter.get('/', validateQuery(eventsQuerySchema), async (_req, res) => {
     ? null
     : await cacheGetSafe<ConflictEventEntity[]>(EVENTS_KEY, LOGICAL_TTL_MS);
 
-  if (cached && !cached.stale && !isLLMConfigured()) {
+  // Raw cache fresh → no upstream fetch. (This gate used to also require
+  // `!isLLMConfigured()`, a leftover from the pre-27.4.6 read-path LLM trigger;
+  // with the LLM configured it forced a GDELT download + ~700KB Redis rewrite on
+  // EVERY request whenever `events:llm:v3` was cold or stale.)
+  if (cached && !cached.stale) {
+    if (llmCached?.data) {
+      return sendNormalizedEvents(res, {
+        data: llmCached.data,
+        stale: true,
+        lastFresh: llmCached.lastFresh,
+      });
+    }
     return sendNormalizedEvents(res, cached);
   }
 
   try {
-    // Extract Bellingcat articles from news cache for corroboration boost (opportunistic)
-    let bellingcatArticles: {
-      title: string;
-      url: string;
-      publishedAt: number;
-      lat?: number;
-      lng?: number;
-    }[] = [];
-    try {
-      const newsCache = await cacheGetSafe<NewsCluster[]>('news:gdelt', 0);
-      if (newsCache?.data) {
-        bellingcatArticles = newsCache.data
-          .flatMap((cluster) => cluster.articles)
-          .filter((a) => a.source === 'Bellingcat')
-          .map((a) => ({
-            title: a.title,
-            url: a.url,
-            publishedAt: a.publishedAt,
-            ...extractBellingcatGeo(a.title),
-          }));
-      }
-    } catch {
-      // Non-fatal: if news cache is unavailable, proceed without corroboration
-      log.warn('failed to fetch Bellingcat articles for corroboration');
-    }
-
-    const fresh = await fetchEvents(bellingcatArticles);
-
-    // Merge: seed with cached data (if any), then overwrite with fresh events
-    const eventMap = new Map<string, ConflictEventEntity>();
-    if (cached) {
-      for (const event of cached.data) {
-        eventMap.set(event.id, event);
-      }
-    }
-
-    // Lazy backfill: seed historical events when cache is empty or forced
-    if ((!cached || forceBackfill) && (forceBackfill || (await shouldBackfill()))) {
-      try {
-        const backfillDays = Math.ceil((Date.now() - WAR_START) / 86_400_000);
-        const backfillData = await backfillEvents(backfillDays);
-        // Merge backfill first so fresh events overwrite any duplicates
-        for (const event of backfillData) {
-          eventMap.set(event.id, event);
-        }
-        await recordBackfillTimestamp();
-        log.info({ count: backfillData.length }, 'backfill: merged historical events');
-      } catch (backfillErr) {
-        log.warn({ err: backfillErr }, 'backfill failed (non-fatal)');
-      }
-    }
-
-    for (const event of fresh) {
-      eventMap.set(event.id, event);
-    }
-
-    // Prune events with timestamp before WAR_START
-    for (const [id, event] of eventMap) {
-      if (event.timestamp < WAR_START) {
-        eventMap.delete(id);
-      }
-    }
-
-    const merged = Array.from(eventMap.values());
-
-    // Inject sourceTier on raw events that don't already have it
-    for (const event of merged) {
-      if (event.data.sourceTier === undefined && event.data.source) {
-        const domain = extractDomain(event.data.source);
-        const tier = domain ? getSourceTier('', domain) : null;
-        if (tier !== null) {
-          event.data.sourceTier = tier;
-        }
-      }
-    }
-
-    // Store raw (undispersed) coordinates — dispersion is applied client-side
-    // in useFilteredEntities so it dynamically adjusts when filters change.
-    await cacheSetSafe(EVENTS_KEY, merged, REDIS_TTL_SEC);
+    const merged = await refreshRawEvents({ cached, forceBackfill });
 
     // Phase 27.4.6 — cache-only path. Pipeline triggers are now cron-driven
     // via /api/cron/refresh-events (server/routes/refresh-events-cron.ts →

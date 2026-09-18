@@ -309,6 +309,13 @@ export const IRAN_BBOX: BoundingBox = {
 export const IRAN_CENTER = { lat: 28.0, lon: 45.0 } as const;
 export const ADSB_RADIUS_NM = 1200;
 
+/**
+ * User-Agent sent on outbound upstream fetches. Node's default (`node`) is
+ * blocklisted by some public APIs — adsb.lol began returning 403 for it, which
+ * took /api/flights down in prod (2026-09). Always identify ourselves.
+ */
+export const OUTBOUND_USER_AGENT = 'otg-iran-monitor/1.0 (+https://otg-iran-monitor.vercel.app)';
+
 // Unit conversion constants (adsb.lol v2 API uses imperial units)
 export const KNOTS_TO_MS = 0.514444;
 export const FEET_TO_METERS = 0.3048;

@@ -55,7 +55,7 @@ import type { LLMRunSummary } from '../server/lib/llmProgress.js';
 const log = logger.child({ module: 'snapshotCronWatch' });
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const OUT_DIR = resolve(__dirname, '../.planning/phases/31-cron-stability-validation-7-day-watch');
+const OUT_DIR = resolve(__dirname, '../.snapshots');
 const OUT_PATH = resolve(OUT_DIR, 'watch-log.json');
 const TMP_PATH = resolve(OUT_DIR, 'watch-log.json.tmp');
 

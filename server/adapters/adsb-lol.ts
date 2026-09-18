@@ -1,4 +1,4 @@
-import { IRAN_CENTER, ADSB_RADIUS_NM } from '../config.js';
+import { IRAN_CENTER, ADSB_RADIUS_NM, OUTBOUND_USER_AGENT } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { RateLimitError } from '../types.js';
 
@@ -17,7 +17,10 @@ export async function fetchFlights(): Promise<FlightEntity[]> {
 
   const url = `${BASE_URL}/v2/lat/${IRAN_CENTER.lat}/lon/${IRAN_CENTER.lon}/dist/${ADSB_RADIUS_NM}`;
 
-  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+  const res = await fetch(url, {
+    headers: { 'User-Agent': OUTBOUND_USER_AGENT },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+  });
 
   if (res.status === 429) {
     throw new RateLimitError('adsb.lol rate limit exceeded');

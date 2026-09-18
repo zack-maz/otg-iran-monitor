@@ -10,7 +10,7 @@
 // via cacheGetSafe only and NEVER writes back (no cacheSet / redis.set).
 //
 // Usage:
-//   npx tsx scripts/audit-gdelt-corpus.ts                 # read live events:llm:v3 + news:gdelt
+//   npx tsx scripts/audit-gdelt-corpus.ts                 # read live events:llm:v3 + news:feed
 //   npx tsx scripts/audit-gdelt-corpus.ts --snapshot s.json  # read a captured snapshot instead
 //   npx tsx scripts/audit-gdelt-corpus.ts -o gdelt-corpus-audit.json
 //   npx tsx scripts/audit-gdelt-corpus.ts --help
@@ -279,7 +279,7 @@ const HELP_TEXT = `
 audit-gdelt-corpus — GDELT-MATCH-01 corpus-quality audit (READ-ONLY, non-destructive)
 
 Categorizes the events:llm:v3 corpus into source-tier buckets, detects orphan
-events (no matching news:gdelt DOC cluster), and sizes duplicate-source clusters.
+events (no matching news:feed DOC cluster), and sizes duplicate-source clusters.
 The structured report sizes the Plan 06 dedup / corroboration / composite thresholds.
 
 Usage:
@@ -305,7 +305,7 @@ async function loadFromRedis(): Promise<Snapshot> {
   try {
     const { cacheGetSafe } = await import('../server/cache/redis.js');
     const eventsRes = await cacheGetSafe<ConflictEventEntity[]>('events:llm:v3', 0);
-    const newsRes = await cacheGetSafe<NewsCluster[]>('news:gdelt', 0);
+    const newsRes = await cacheGetSafe<NewsCluster[]>('news:feed', 0);
     return {
       events: eventsRes?.data ?? [],
       clusters: newsRes?.data ?? [],

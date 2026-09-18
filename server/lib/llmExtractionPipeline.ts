@@ -60,6 +60,7 @@ import {
 import { openRunRecord, closeRunRecord } from './llmRunHistory.js';
 import { shouldPauseNewEvents, prioritizeBySeverity } from './llmTokenBudget.js';
 import { logger } from './logger.js';
+import { EVENTS_KEY, EVENTS_LOGICAL_TTL_MS, refreshRawEvents } from './rawEventsRefresh.js';
 import { computeCompositeScore } from './relevanceScorer.js';
 import { safeWaitUntil } from './safeWaitUntil.js';
 import { getHighestTier } from './sourceTiers.js';
@@ -90,9 +91,6 @@ const log = logger.child({ module: 'llm-extraction-pipeline' });
 // Cache keys + TTL constants (mirrors the values previously held in events.ts).
 // Phase 29 D-02 part C — `*_ACTIVE` inlined to v3 constants since v1+v2 are gone.
 // ---------------------------------------------------------------------------
-
-/** Redis key for raw GDELT events the helper reads as input. */
-const EVENTS_KEY = 'events:gdelt';
 
 /**
  * Active terminal LLM cache key. v3-only post-Phase-29.
@@ -284,20 +282,30 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
     return { dispatched: false, reason: 'llm_unconfigured', schemaVersion: 'v3' };
   }
 
-  // 5. Read raw GDELT — the v3 extractor needs the raw rows to group; the
-  //    cron path has no incoming request to seed from. Use a permissive max
-  //    age so we accept any cached GDELT data (the route's polling already
-  //    keeps it warm).
-  let rawCached: { data: ConflictEventEntity[] } | null = null;
+  // 5. Read raw GDELT — the v3 extractor needs the raw rows to group. The cron
+  //    has no incoming client to keep `events:gdelt` warm, so when the key is
+  //    missing or stale, refresh it here. (Before 2026-09 this was a cache-only
+  //    read: with no dashboard tab open inside the key's 150-min hard TTL every
+  //    run exited `no_raw_events` and `events:llm:v3` stayed cold indefinitely.)
+  let rawCached: { data: ConflictEventEntity[]; stale?: boolean } | null = null;
   try {
-    rawCached = await cacheGetSafe<ConflictEventEntity[]>(EVENTS_KEY, 999_999_999);
+    rawCached = await cacheGetSafe<ConflictEventEntity[]>(EVENTS_KEY, EVENTS_LOGICAL_TTL_MS);
   } catch {
     rawCached = null;
   }
-  if (!rawCached?.data || rawCached.data.length === 0) {
+  let merged: ConflictEventEntity[] = rawCached?.data ?? [];
+  if (merged.length === 0 || rawCached?.stale) {
+    try {
+      merged = await refreshRawEvents({ cached: rawCached, skipBackfill: true });
+      log.info({ count: merged.length }, 'cron: refreshed raw GDELT cache before extraction');
+    } catch (err) {
+      // GDELT down → fall back to whatever (stale) raw rows we already had.
+      log.warn({ err }, 'cron: raw GDELT refresh failed; using cached rows if any');
+    }
+  }
+  if (merged.length === 0) {
     return { dispatched: false, reason: 'no_raw_events', schemaVersion: 'v3' };
   }
-  const merged = rawCached.data;
 
   // 6. Pipeline-busy guard — preserves single-flight semantics so we never
   //    stack two parallel extractor runs (anti-pattern #18).
@@ -566,14 +574,14 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
           log.warn({ err: evalErr }, 'eval harness threw; continuing pipeline');
         }
 
-        // GDELT-MATCH-03/04 — read the OSINT clusters (`news:gdelt`) so the
+        // GDELT-MATCH-03/04 — read the OSINT clusters (`news:feed`) so the
         // strict three-gate corroboration boost can be folded into each
         // entity's additive compositeScore. Best-effort: a missing/failed read
         // simply yields a tier+precision composite with zero corroboration —
         // never blocks the write, never mutates the raw corpus (D-07).
         let newsClusters: NewsCluster[] | undefined;
         try {
-          const newsCache = await cacheGetSafe<NewsCluster[]>('news:gdelt', 0);
+          const newsCache = await cacheGetSafe<NewsCluster[]>('news:feed', 0);
           if (newsCache?.data) newsClusters = newsCache.data;
         } catch {
           /* best-effort — corroboration boost defaults to 0 */
@@ -699,7 +707,7 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
 export function enrichedV3ToEntities(
   geocoded: GeocodedEnrichedEventV3[],
   groups: Array<{ key: string; entities: ConflictEventEntity[]; sourceUrls: string[] }>,
-  // GDELT-MATCH-03/04 — optional OSINT clusters (`news:gdelt`) for the strict
+  // GDELT-MATCH-03/04 — optional OSINT clusters (`news:feed`) for the strict
   // three-gate corroboration boost folded into compositeScore. Omitted callers
   // (legacy / tests) get a tier+precision composite with zero corroboration.
   newsClusters?: NewsCluster[],

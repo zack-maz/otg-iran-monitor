@@ -6,8 +6,13 @@ import type { Request, Response, NextFunction } from 'express';
 // Mock @upstash/ratelimit
 const mockLimit = vi.fn();
 
+const constructedPrefixes: string[] = [];
+
 class MockRatelimit {
   limit = mockLimit;
+  constructor(opts: { prefix: string }) {
+    constructedPrefixes.push(opts.prefix);
+  }
   static slidingWindow(_tokens: number, _window: string) {
     return 'sliding-window-config';
   }
@@ -69,6 +74,27 @@ function createMockRes(): Partial<Response> & {
 describe('rateLimitMiddleware', () => {
   beforeEach(() => {
     mockLimit.mockReset();
+  });
+
+  it('gives every tier its own Redis prefix so per-IP counters are not shared', () => {
+    // @upstash/ratelimit keys on `${prefix}:${identifier}`; a shared prefix means
+    // flights polling burns the sites/water/weather budgets.
+    expect(constructedPrefixes.length).toBeGreaterThanOrEqual(Object.keys(rateLimiters).length);
+    expect(new Set(constructedPrefixes).size).toBe(constructedPrefixes.length);
+    expect(constructedPrefixes).toContain('ratelimit:prod:flights');
+    expect(constructedPrefixes).toContain('ratelimit:prod:sites');
+  });
+
+  it('degrades open (next, no 500) when the limiter backend throws', async () => {
+    mockLimit.mockRejectedValue(new Error('upstash down'));
+    const req = createMockReq();
+    const res = createMockRes();
+    const next = vi.fn();
+
+    await rateLimitMiddleware(req as Request, res as unknown as Response, next as NextFunction);
+
+    expect(next).toHaveBeenCalledWith();
+    expect(res._status).toBe(200);
   });
 
   it('calls next() when under rate limit', async () => {

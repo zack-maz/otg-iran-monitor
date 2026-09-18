@@ -36,7 +36,7 @@ Use [Vercel](https://vercel.com/) for both tiers:
 - The Vite SPA is built via `npm run build` and served as static
   assets from the global Vercel Edge CDN.
 - The Express API is wrapped in a thin serverless entry point
-  (`server/vercel.ts` → `createApp()` factory in `server/app.ts`) and
+  (`server/vercel-entry.ts` → `createApp()` factory in `server/index.ts`) and
   deployed as a serverless function via `vercel.json` rewrites
   (`/api/*` → the function, everything else → SPA `index.html`).
 - The build pipeline is `vite build` for the frontend plus `tsup` for
@@ -80,7 +80,7 @@ Use [Vercel](https://vercel.com/) for both tiers:
 - **CJS server bundle is awkward.** `tsup` emits CommonJS because
   Vercel's Node runtime expects it, but the rest of the server code
   is written as ES modules. The factory pattern
-  (`createApp()` + separate `server/vercel.ts` entry) keeps this
+  (`createApp()` + separate `server/vercel-entry.ts` entry) keeps this
   ugliness contained to one file.
 - **Function cold starts on low-traffic paths.** Routes that aren't
   hit frequently take 300-800 ms on first request after idle. Edge
@@ -97,7 +97,7 @@ Use [Vercel](https://vercel.com/) for both tiers:
 - **Compression is gated by `VERCEL` env var.** Local dev gets
   gzip/brotli via the Express `compression` middleware for realistic
   testing; Vercel production skips it because the edge CDN handles
-  compression. See `server/app.ts`.
+  compression. See `server/index.ts`.
 - **Graceful SIGTERM handling is only wired in the `isMainModule`
   block.** Vercel has its own 500 ms teardown window and Upstash is
   REST-based (no connections to drain), so the SIGTERM handler is
@@ -127,12 +127,12 @@ Use [Vercel](https://vercel.com/) for both tiers:
 
 ## References
 
-- [`server/vercel.ts`](../../server/vercel.ts) — serverless entry
+- [`server/vercel-entry.ts`](../../server/vercel-entry.ts) — serverless entry
   point that exports the Express app.
-- [`server/app.ts`](../../server/app.ts) — `createApp()` factory
+- [`server/index.ts`](../../server/index.ts) — `createApp()` factory
   shared by local dev and Vercel.
 - [`vercel.json`](../../vercel.json) — rewrites and cron schedule.
-- [`docs/architecture/deployment.md`](../architecture/deployment.md) —
+- `docs/architecture/deployment.md` —
   Vercel topology diagram, build pipeline, and per-route cache header
   table.
 - Phase 14 CONTEXT and SUMMARY

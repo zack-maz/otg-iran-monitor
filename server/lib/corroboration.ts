@@ -3,7 +3,7 @@
  *
  * Generalizes the Phase-22 Bellingcat three-gate (`checkBellingcatCorroboration`
  * in `eventScoring.ts`) from Bellingcat-specific articles to ANY tier-1/2 OSINT
- * source carried in the `news:gdelt` GDELT-DOC clusters.
+ * source carried in the `news:feed` GDELT-DOC clusters.
  *
  * A corroboration boost is granted ONLY when ALL THREE gates pass against the
  * same news article:
@@ -37,10 +37,10 @@ import type { ConflictEventEntity, NewsCluster } from '../types.js';
 // ---- Three-gate constants (sized off the Phase-22 Bellingcat gate) ----
 //
 // GDELT-MATCH-03 sizing caveat (38-03-SUMMARY.md): the audit's orphan/
-// corroboration baseline was UNUSABLE (empty `news:gdelt` in dev gave a 100%
+// corroboration baseline was UNUSABLE (empty `news:feed` in dev gave a 100%
 // orphan artifact). These thresholds therefore mirror the proven Bellingcat
 // three-gate (±24h, 200km, ≥2 keyword) CONSERVATIVELY and need a re-validation
-// pass against a populated `news:gdelt` before any loosening.
+// pass against a populated `news:feed` before any loosening.
 const CORROBORATION_TEMPORAL_WINDOW_MS = 24 * 60 * 60 * 1000; // ±24h
 const CORROBORATION_GEO_RADIUS_KM = 200;
 const CORROBORATION_MIN_KEYWORD_MATCHES = 2;
@@ -134,7 +134,7 @@ export interface CorroborationResult {
 
 /**
  * Check whether an event is corroborated by any tier-1/2/3 OSINT article in the
- * `news:gdelt` clusters using the strict three-gate. Returns the highest boost
+ * `news:feed` clusters using the strict three-gate. Returns the highest boost
  * found (best tier wins) or `{ corroborated: false, boost: 0, tier: null }`.
  */
 export function checkCorroboration(

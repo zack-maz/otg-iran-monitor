@@ -158,6 +158,9 @@ var redactPaths = [
   "req.headers.cookie",
   'req.headers["x-api-key"]',
   'res.headers["set-cookie"]',
+  'req.headers["x-vercel-oidc-token"]',
+  'req.headers["x-vercel-proxy-signature"]',
+  "req.headers.forwarded",
   "*.UPSTASH_REDIS_REST_TOKEN",
   "*.OPENSKY_CLIENT_SECRET",
   "*.AISSTREAM_API_KEY",
@@ -225,11 +228,23 @@ function errorHandler(err, req, res, _next) {
 init_redis();
 import { timingSafeEqual } from "crypto";
 import { Ratelimit } from "@upstash/ratelimit";
-function createRateLimiter(maxRequests, windowSec, prefix = "ratelimit:prod") {
+var INCR429_TTL_SEC = 48 * 60 * 60;
+async function incr429(tier) {
+  try {
+    const ymd = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const key = `ratelimit:429:${tier}:${ymd}`;
+    const used = await redis.incr(key);
+    if (used === 1) {
+      await redis.expire(key, INCR429_TTL_SEC);
+    }
+  } catch {
+  }
+}
+function createRateLimiter(maxRequests, windowSec, prefix = "ratelimit:prod", tierName) {
   const limiter = new Ratelimit({
     redis,
     limiter: Ratelimit.slidingWindow(maxRequests, `${windowSec} s`),
-    prefix
+    prefix: tierName ? `${prefix}:${tierName}` : prefix
   });
   return async function rateLimitHandler(req, res, next) {
     if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
@@ -256,11 +271,18 @@ function createRateLimiter(maxRequests, windowSec, prefix = "ratelimit:prod") {
       }
     }
     const identifier = req.ip ?? req.headers["x-forwarded-for"] ?? "anonymous";
-    const result = await limiter.limit(identifier);
+    let result;
+    try {
+      result = await limiter.limit(identifier);
+    } catch {
+      next();
+      return;
+    }
     res.set("X-RateLimit-Limit", String(result.limit));
     res.set("X-RateLimit-Remaining", String(result.remaining));
     res.set("X-RateLimit-Reset", String(result.reset));
     if (!result.success) {
+      void incr429(tierName ?? prefix);
       res.status(429).json({
         error: "Too many requests",
         code: "RATE_LIMITED",
@@ -273,25 +295,25 @@ function createRateLimiter(maxRequests, windowSec, prefix = "ratelimit:prod") {
 }
 var rateLimiters = {
   /** 120 req/min — flights poll every 5s in the browser; allow 2x headroom for tab focus bursts. */
-  flights: createRateLimiter(120, 60),
+  flights: createRateLimiter(120, 60, "ratelimit:prod", "flights"),
   /** 60 req/min — ships poll every 30s; allow burst when AISStream batches arrive. */
-  ships: createRateLimiter(60, 60),
+  ships: createRateLimiter(60, 60, "ratelimit:prod", "ships"),
   /** 20 req/min — events served from 15-min GDELT cache; clients rarely re-fetch. */
-  events: createRateLimiter(20, 60),
+  events: createRateLimiter(20, 60, "ratelimit:prod", "events"),
   /** 20 req/min — news served from 15-min GDELT DOC cache; matches events cadence. */
-  news: createRateLimiter(20, 60),
+  news: createRateLimiter(20, 60, "ratelimit:prod", "news"),
   /** 30 req/min — markets poll every 60s; allow modest burst on tab focus. */
-  markets: createRateLimiter(30, 60),
+  markets: createRateLimiter(30, 60, "ratelimit:prod", "markets"),
   /** 10 req/min — weather refreshed at 30-min cache TTL; barely polled. */
-  weather: createRateLimiter(10, 60),
+  weather: createRateLimiter(10, 60, "ratelimit:prod", "weather"),
   /** 10 req/min — sites are static infrastructure, fetched once on mount. */
-  sites: createRateLimiter(10, 60),
+  sites: createRateLimiter(10, 60, "ratelimit:prod", "sites"),
   /** 30 req/min — /api/sources is a lightweight config check, can spike on UI mounts. */
-  sources: createRateLimiter(30, 60),
+  sources: createRateLimiter(30, 60, "ratelimit:prod", "sources"),
   /** 10 req/min — Nominatim downstream caps us at 1 rps; cache aggressively. */
-  geocode: createRateLimiter(10, 60),
+  geocode: createRateLimiter(10, 60, "ratelimit:prod", "geocode"),
   /** 10 req/min — water facilities are static, fetched once on mount. */
-  water: createRateLimiter(10, 60),
+  water: createRateLimiter(10, 60, "ratelimit:prod", "water"),
   /**
    * 60 req/min — public global pre-filter for /api/* routes.
    *
@@ -321,7 +343,20 @@ var rateLimiters = {
    * Key prefix `'ratelimit:public'` namespaces this tier's counters so
    * they don't collide with per-endpoint counters under `'ratelimit:prod'`.
    */
-  public: createRateLimiter(60, 60, "ratelimit:public")
+  public: createRateLimiter(60, 60, "ratelimit:public", "public")
+};
+var RATE_LIMITER_CONFIG = {
+  flights: { max: 120, windowSec: 60 },
+  ships: { max: 60, windowSec: 60 },
+  events: { max: 20, windowSec: 60 },
+  news: { max: 20, windowSec: 60 },
+  markets: { max: 30, windowSec: 60 },
+  weather: { max: 10, windowSec: 60 },
+  sites: { max: 10, windowSec: 60 },
+  sources: { max: 30, windowSec: 60 },
+  geocode: { max: 10, windowSec: 60 },
+  water: { max: 10, windowSec: 60 },
+  public: { max: 60, windowSec: 60 }
 };
 
 // server/routes/audit-status.ts
@@ -593,6 +628,7 @@ var IRAN_BBOX = {
 };
 var IRAN_CENTER = { lat: 28, lon: 45 };
 var ADSB_RADIUS_NM = 1200;
+var OUTBOUND_USER_AGENT = "otg-iran-monitor/1.0 (+https://otg-iran-monitor.vercel.app)";
 var KNOTS_TO_MS = 0.514444;
 var FEET_TO_METERS = 0.3048;
 var FPM_TO_MS = 508e-5;
@@ -625,20 +661,35 @@ var NEWS_CLUSTER_WINDOW_MS = 864e5;
 var NEWS_JACCARD_THRESHOLD = 0.8;
 var NEWS_MIN_TOKENS_FOR_FUZZY = 5;
 
+// server/lib/cronWatch.ts
+init_redis();
+var log2 = logger.child({ module: "cron-watch" });
+var CRON_WATCH_KEY = "cron:watch:v2";
+var CRON_WATCH_MAX = 14;
+var CRON_WATCH_TTL_SEC = 30 * 24 * 3600;
+async function appendWatchSample(sample) {
+  try {
+    await redis.pipeline().lpush(CRON_WATCH_KEY, JSON.stringify(sample)).ltrim(CRON_WATCH_KEY, 0, CRON_WATCH_MAX - 1).expire(CRON_WATCH_KEY, CRON_WATCH_TTL_SEC).exec();
+  } catch (err) {
+    log2.warn({ err }, "cronWatch append failed");
+  }
+}
+
 // server/lib/healthSources.ts
 var SOURCE_KEYS = {
   flights: "flights:adsblol",
   ships: "ships:ais",
   events: "events:gdelt",
-  // DRIFT-1: route writer is news:feed. The legacy 'news:gdelt' is the LLM
-  // extractor side-input, never updated by the news route.
+  // The news route writes `news:feed`; it is also the LLM extractor's and the
+  // corroboration scorer's news side-input. (Those readers pointed at a legacy
+  // `news:gdelt` key that nothing wrote until 2026-09.)
   news: "news:feed",
   markets: "markets:yahoo:1d",
   weather: "weather:open-meteo",
   // DRIFT-2: route writer bumped to sites:v3 in Phase 27.3.1.
   sites: "sites:v3",
-  // DRIFT-3: route writer bumped to water:facilities:v3 in Phase 27.3.2.
-  water: "water:facilities:v3",
+  // DRIFT-3: route writer bumped to water:facilities:v4 in Phase 42 (name-aware dedup).
+  water: "water:facilities:v4",
   // DRIFT-4: waterPrecip was in thresholds + tier but missing from SOURCE_KEYS — operator-reported in 28.2.5.
   waterPrecip: "water:precip",
   // Phase 37 (fix/prod-audit-tier-regression): `events:llm:v3` is the primary cache
@@ -687,6 +738,14 @@ var FRESHNESS_THRESHOLDS_MS = {
   // 26 h — D-25
   llmEvents: 26 * 60 * 6e4
   // 26 h — D-25 (matches cron triad — 28.2.5 D-06)
+};
+var CRON_SCHEDULE_GRACE_MS = {
+  health: { expectedIntervalMs: 24 * 60 * 6e4, graceMs: 4 * 60 * 6e4 },
+  // 0 0 * * *
+  warm: { expectedIntervalMs: 24 * 60 * 6e4, graceMs: 4 * 60 * 6e4 },
+  // 0 12 * * *
+  "refresh-events": { expectedIntervalMs: 24 * 60 * 6e4, graceMs: 4 * 60 * 6e4 }
+  // 0 4 * * *
 };
 var TIER_BY_ENDPOINT = {
   flights: "critical",
@@ -737,6 +796,11 @@ function deriveStatus(freshnessMs, thresholdMs, hadError) {
   if (freshnessMs <= 2 * thresholdMs) return "degraded";
   return "unhealthy";
 }
+function deriveCronRunState(freshnessMs, expectedIntervalMs, graceMs, hasFiredYet) {
+  if (freshnessMs === null) return hasFiredYet ? "missed" : "unknown";
+  if (freshnessMs <= expectedIntervalMs + graceMs) return "healthy";
+  return "missed";
+}
 
 // server/lib/llmEvalHarness.ts
 init_redis();
@@ -752,7 +816,7 @@ function isLLMConfigured() {
 // server/cache/devFileCache.ts
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
-var log2 = logger.child({ module: "dev-file-cache" });
+var log3 = logger.child({ module: "dev-file-cache" });
 var DEV_CACHE_DIR = join(process.cwd(), ".dev-cache");
 var LLM_EVENTS_FILE = join(DEV_CACHE_DIR, "llm-events.json");
 var LLM_EVENTS_FILE_V2 = join(DEV_CACHE_DIR, "llm-events-v2.json");
@@ -766,9 +830,9 @@ function saveDevLLMCacheV2(data) {
     }
     const entry = { data, savedAt: Date.now() };
     writeFileSync(LLM_EVENTS_FILE_V2, JSON.stringify(entry));
-    log2.info("saved LLM events to dev file cache (v2)");
+    log3.info("saved LLM events to dev file cache (v2)");
   } catch (err) {
-    log2.warn({ err }, "failed to write dev file cache (v2)");
+    log3.warn({ err }, "failed to write dev file cache (v2)");
   }
 }
 function loadDevLLMCacheV2() {
@@ -779,16 +843,16 @@ function loadDevLLMCacheV2() {
     const entry = JSON.parse(raw);
     const age = Date.now() - entry.savedAt;
     if (age > MAX_AGE_MS) {
-      log2.info({ ageMs: age }, "dev file cache (v2) too old, ignoring");
+      log3.info({ ageMs: age }, "dev file cache (v2) too old, ignoring");
       return null;
     }
-    log2.info(
+    log3.info(
       { ageMs: age, ageMin: Math.round(age / 6e4) },
       "loaded LLM events from dev file cache (v2)"
     );
     return entry.data;
   } catch (err) {
-    log2.warn({ err }, "failed to read dev file cache (v2)");
+    log3.warn({ err }, "failed to read dev file cache (v2)");
     return null;
   }
 }
@@ -800,9 +864,9 @@ function saveDevWaterCache(data) {
     if (!existsSync(DEV_CACHE_DIR)) mkdirSync(DEV_CACHE_DIR, { recursive: true });
     const entry = { data, savedAt: Date.now() };
     writeFileSync(WATER_FACILITIES_FILE, JSON.stringify(entry));
-    log2.info("saved water facilities to dev file cache");
+    log3.info("saved water facilities to dev file cache");
   } catch (err) {
-    log2.warn({ err }, "failed to write water facilities dev cache");
+    log3.warn({ err }, "failed to write water facilities dev cache");
   }
 }
 function loadDevWaterCache() {
@@ -813,16 +877,16 @@ function loadDevWaterCache() {
     const entry = JSON.parse(raw);
     const age = Date.now() - entry.savedAt;
     if (age > WATER_MAX_AGE_MS) {
-      log2.info({ ageMs: age }, "water facility dev cache too old, ignoring");
+      log3.info({ ageMs: age }, "water facility dev cache too old, ignoring");
       return null;
     }
-    log2.info(
+    log3.info(
       { ageMs: age, ageHr: Math.round(age / 36e5) },
       "loaded water facilities from dev file cache"
     );
     return entry.data;
   } catch (err) {
-    log2.warn({ err }, "failed to read water facility dev cache");
+    log3.warn({ err }, "failed to read water facility dev cache");
     return null;
   }
 }
@@ -1132,7 +1196,7 @@ function groupGdeltRows(entities) {
 
 // server/lib/llmDLQ.ts
 init_redis();
-var log3 = logger.child({ module: "llm-dlq" });
+var log4 = logger.child({ module: "llm-dlq" });
 var DLQ_KEY = "events:llm-dlq";
 var DLQ_TTL_SEC = 7 * 24 * 3600;
 var DLQ_MAX = 200;
@@ -1167,7 +1231,7 @@ async function enqueueDLQ(entry) {
       if (toRemove.length > 0) await redis.srem(DLQ_KEY, ...toRemove);
     }
   } catch (err) {
-    log3.warn({ err, id: entry.id }, "DLQ enqueue failed (redis unreachable)");
+    log4.warn({ err, id: entry.id }, "DLQ enqueue failed (redis unreachable)");
   }
 }
 async function listDLQ(limit = 50) {
@@ -1835,7 +1899,7 @@ function buildSummary() {
 }
 
 // server/lib/llmCallHistory.ts
-var log4 = logger.child({ module: "llm-call-history" });
+var log5 = logger.child({ module: "llm-call-history" });
 var CALLS_KEY = "llm:calls:history";
 var CALLS_MAX = 500;
 var CALLS_TTL_SEC = 30 * 24 * 3600;
@@ -1854,7 +1918,7 @@ async function appendCallHistory(entry) {
     await redis.ltrim(CALLS_KEY, 0, CALLS_MAX - 1);
     await redis.expire(CALLS_KEY, CALLS_TTL_SEC);
   } catch (err) {
-    log4.warn({ err }, "callHistory append failed");
+    log5.warn({ err }, "callHistory append failed");
   }
 }
 async function listCallHistory(limit = CALLS_MAX) {
@@ -1998,7 +2062,7 @@ function todayKey() {
   ).padStart(2, "0")}`;
 }
 async function callLLM(messages, _schemaText, opts = {}) {
-  const log40 = logger.child({ component: "freeClaudeRouter" });
+  const log43 = logger.child({ component: "freeClaudeRouter" });
   const decisions = [];
   const includeOpenRouter = !opts.skipOpenRouter;
   const allProviders = [
@@ -2130,7 +2194,7 @@ async function callLLM(messages, _schemaText, opts = {}) {
           callHistory: [failureEntry, ...history].slice(0, 20)
         });
         void appendCallHistory(failureEntry);
-        log40.warn(
+        log43.warn(
           {
             provider: p.name,
             attempt,
@@ -2154,7 +2218,7 @@ async function callLLM(messages, _schemaText, opts = {}) {
       record(p.name, "err");
     }
   }
-  log40.warn("all free providers unavailable \u2014 returning null content");
+  log43.warn("all free providers unavailable \u2014 returning null content");
   return { content: null, routing: decisions };
 }
 var LATENCY_RING_CAP = 100;
@@ -2228,7 +2292,7 @@ async function accrueShadowCost(tokensIn, tokensOut) {
   }
 }
 async function prewarmIfCold() {
-  const log40 = logger.child({ component: "freeClaudeRouter.prewarmIfCold" });
+  const log43 = logger.child({ component: "freeClaudeRouter.prewarmIfCold" });
   const client = getNvidiaNimClient();
   if (!client) {
     updateProgress({ prewarmState: "unknown" });
@@ -2254,7 +2318,7 @@ async function prewarmIfCold() {
       prewarmState: "cold-fired"
     });
   } catch (err) {
-    log40.warn(
+    log43.warn(
       { err: err instanceof Error ? err.message : String(err) },
       "prewarmIfCold synthetic call failed (non-fatal)"
     );
@@ -2267,7 +2331,7 @@ async function prewarmIfCold() {
 }
 
 // server/lib/llmExtractorWatchdog.ts
-var log5 = logger.child({ module: "llm-watchdog" });
+var log6 = logger.child({ module: "llm-watchdog" });
 async function withBatchWatchdog(batchFn, opts) {
   let timedOut = false;
   let hardTimer;
@@ -2287,14 +2351,14 @@ async function withBatchWatchdog(batchFn, opts) {
     return result;
   } catch (err) {
     if (timedOut) {
-      log5.warn(
+      log6.warn(
         { batchIndex: opts.batchIndex, label: opts.label, timeoutMs: opts.timeoutMs },
         "batch hard-timeout triggered"
       );
       try {
         await opts.onTimeout();
       } catch (hookErr) {
-        log5.error(
+        log6.error(
           { err: hookErr, batchIndex: opts.batchIndex, label: opts.label },
           "onTimeout hook threw \u2014 suppressed, returning null"
         );
@@ -2320,7 +2384,7 @@ function computeLineageHash(eventId, prompt, model) {
 async function appendLineage(eventId, payload) {
   const lineageHash = computeLineageHash(eventId, payload.prompt, payload.model);
   const key = `${LINEAGE_KEY_PREFIX}${eventId}`;
-  const log40 = logger.child({ component: "llm-lineage" });
+  const log43 = logger.child({ component: "llm-lineage" });
   try {
     await redis.hset(key, {
       prompt: payload.prompt.slice(0, 32e3),
@@ -2340,7 +2404,7 @@ async function appendLineage(eventId, payload) {
     await redis.zremrangebyrank(LINEAGE_INDEX_KEY, 0, -LINEAGE_MAX_ENTRIES - 1);
     await redis.expire(LINEAGE_INDEX_KEY, LINEAGE_TTL_SEC);
   } catch (err) {
-    log40.warn({ err, eventId }, "lineage append failed (redis unreachable)");
+    log43.warn({ err, eventId }, "lineage append failed (redis unreachable)");
   }
   return { lineageHash };
 }
@@ -2624,7 +2688,7 @@ var batchResponseV3 = z2.object({
 import { readFileSync as readFileSync2, existsSync as existsSync2 } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
-var log6 = logger.child({ module: "sites-snapshot" });
+var log7 = logger.child({ module: "sites-snapshot" });
 var __dirname = dirname(fileURLToPath(import.meta.url));
 var SNAPSHOT_PATH = resolve(__dirname, "../../src/data/sites.json");
 var cachedSnapshot = void 0;
@@ -2632,7 +2696,7 @@ function loadSitesSnapshot() {
   if (cachedSnapshot !== void 0) return cachedSnapshot;
   try {
     if (!existsSync2(SNAPSHOT_PATH)) {
-      log6.info(
+      log7.info(
         { path: SNAPSHOT_PATH },
         "sites snapshot file absent; cold-start will hit Overpass on refresh"
       );
@@ -2644,12 +2708,12 @@ function loadSitesSnapshot() {
     try {
       parsed = JSON.parse(raw);
     } catch (parseErr) {
-      log6.warn({ err: parseErr, path: SNAPSHOT_PATH }, "sites snapshot JSON parse failed");
+      log7.warn({ err: parseErr, path: SNAPSHOT_PATH }, "sites snapshot JSON parse failed");
       cachedSnapshot = null;
       return null;
     }
     if (!isValidSnapshot(parsed)) {
-      log6.warn({ path: SNAPSHOT_PATH }, "sites snapshot failed structural validation; ignoring");
+      log7.warn({ path: SNAPSHOT_PATH }, "sites snapshot failed structural validation; ignoring");
       cachedSnapshot = null;
       return null;
     }
@@ -2662,14 +2726,14 @@ function loadSitesSnapshot() {
         generatedAt: parsed.generatedAt
       }
     };
-    log6.info(
+    log7.info(
       { count: snapshot.sites.length, generatedAt: snapshot.generatedAt },
       "loaded sites snapshot"
     );
     cachedSnapshot = snapshot;
     return snapshot;
   } catch (err) {
-    log6.warn({ err, path: SNAPSHOT_PATH }, "failed to load sites snapshot");
+    log7.warn({ err, path: SNAPSHOT_PATH }, "failed to load sites snapshot");
     cachedSnapshot = null;
     return null;
   }
@@ -2687,7 +2751,7 @@ function isValidSnapshot(v) {
 import { readFileSync as readFileSync3, existsSync as existsSync3 } from "fs";
 import { resolve as resolve2, dirname as dirname2 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
-var log7 = logger.child({ module: "water-snapshot" });
+var log8 = logger.child({ module: "water-snapshot" });
 var __dirname2 = dirname2(fileURLToPath2(import.meta.url));
 var SNAPSHOT_PATH2 = resolve2(__dirname2, "../../src/data/water-facilities.json");
 var cachedSnapshot2 = void 0;
@@ -2695,7 +2759,7 @@ function loadWaterSnapshot() {
   if (cachedSnapshot2 !== void 0) return cachedSnapshot2;
   try {
     if (!existsSync3(SNAPSHOT_PATH2)) {
-      log7.info(
+      log8.info(
         { path: SNAPSHOT_PATH2 },
         "water snapshot file absent; cold-start will fall through to Overpass"
       );
@@ -2707,12 +2771,12 @@ function loadWaterSnapshot() {
     try {
       parsed = JSON.parse(raw);
     } catch (parseErr) {
-      log7.warn({ err: parseErr, path: SNAPSHOT_PATH2 }, "water snapshot JSON parse failed");
+      log8.warn({ err: parseErr, path: SNAPSHOT_PATH2 }, "water snapshot JSON parse failed");
       cachedSnapshot2 = null;
       return null;
     }
     if (!isValidSnapshot2(parsed)) {
-      log7.warn({ path: SNAPSHOT_PATH2 }, "water snapshot failed structural validation; ignoring");
+      log8.warn({ path: SNAPSHOT_PATH2 }, "water snapshot failed structural validation; ignoring");
       cachedSnapshot2 = null;
       return null;
     }
@@ -2725,14 +2789,14 @@ function loadWaterSnapshot() {
         generatedAt: parsed.generatedAt
       }
     };
-    log7.info(
+    log8.info(
       { count: snapshot.facilities.length, generatedAt: snapshot.generatedAt },
       "loaded water snapshot"
     );
     cachedSnapshot2 = snapshot;
     return snapshot;
   } catch (err) {
-    log7.warn({ err, path: SNAPSHOT_PATH2 }, "failed to load water snapshot");
+    log8.warn({ err, path: SNAPSHOT_PATH2 }, "failed to load water snapshot");
     cachedSnapshot2 = null;
     return null;
   }
@@ -2747,7 +2811,7 @@ function isValidSnapshot2(v) {
 }
 
 // server/lib/llmResolver.ts
-var log8 = logger.child({ module: "llm-resolver" });
+var log9 = logger.child({ module: "llm-resolver" });
 var GEOCODE_CACHE_PREFIX = "geocode:fwd:constrained:v2:";
 var GEOCODE_CACHE_LOGICAL_TTL_MS = 30 * 24 * 3600 * 1e3;
 var GEOCODE_CACHE_REDIS_TTL_SEC = 30 * 24 * 3600;
@@ -2901,7 +2965,7 @@ async function resolveViaPoiAmenity(hierarchy) {
     await cacheSetSafe(key, hit, GEOCODE_CACHE_REDIS_TTL_SEC);
     return hit;
   } catch (err) {
-    log8.warn({ err, landmark: hierarchy.landmark }, "resolveViaPoiAmenity failed");
+    log9.warn({ err, landmark: hierarchy.landmark }, "resolveViaPoiAmenity failed");
     return null;
   }
 }
@@ -2949,7 +3013,7 @@ async function resolveViaNominatimDirect(hierarchy) {
     await cacheSetSafe(key, hit, GEOCODE_CACHE_REDIS_TTL_SEC);
     return hit;
   } catch (err) {
-    log8.warn({ err, query }, "nominatim-direct failed");
+    log9.warn({ err, query }, "nominatim-direct failed");
     return null;
   }
 }
@@ -3054,7 +3118,7 @@ async function resolveViaVerifiedTwoPass(hierarchy, ctx) {
     }
     const validated = rerankerResponseSchema.safeParse(parsed);
     if (!validated.success) {
-      log8.warn({ issues: validated.error.issues }, "reranker response failed Zod parse");
+      log9.warn({ issues: validated.error.issues }, "reranker response failed Zod parse");
       return null;
     }
     const idx = validated.data.pick - 1;
@@ -3064,7 +3128,7 @@ async function resolveViaVerifiedTwoPass(hierarchy, ctx) {
     await cacheSetSafe(key, hit, GEOCODE_CACHE_REDIS_TTL_SEC);
     return hit;
   } catch (err) {
-    log8.warn({ err, query }, "two-pass verify failed");
+    log9.warn({ err, query }, "two-pass verify failed");
     return null;
   }
 }
@@ -3094,7 +3158,7 @@ async function resolveLocation(hierarchy, ctx) {
       };
     }
   } catch (err) {
-    log8.warn({ err }, "own-site-snapshot path threw");
+    log9.warn({ err }, "own-site-snapshot path threw");
   }
   if (isPoiLandmark(hierarchy.landmark)) {
     try {
@@ -3107,14 +3171,14 @@ async function resolveLocation(hierarchy, ctx) {
         };
       }
     } catch (err) {
-      log8.warn({ err }, "poi-amenity-nominatim path threw");
+      log9.warn({ err }, "poi-amenity-nominatim path threw");
     }
   }
   let directHit = null;
   try {
     directHit = await resolveViaNominatimDirect(hierarchy);
   } catch (err) {
-    log8.warn({ err }, "nominatim-direct path threw");
+    log9.warn({ err }, "nominatim-direct path threw");
   }
   const precision = derivePrecision(hierarchy);
   const shouldVerify = precision === "city" || precision === "region" || precision === "neighborhood" || directHit !== null && haversineKm3(directHit.lat, directHit.lng, ctx.centroidLat, ctx.centroidLng) > 250;
@@ -3134,7 +3198,7 @@ async function resolveLocation(hierarchy, ctx) {
         };
       }
     } catch (err) {
-      log8.warn({ err }, "two-pass verify path threw; accepting direct hit");
+      log9.warn({ err }, "two-pass verify path threw; accepting direct hit");
     }
   }
   if (directHit) {
@@ -3159,21 +3223,21 @@ async function resolveLocation(hierarchy, ctx) {
       };
     }
   } catch (err) {
-    log8.warn({ err }, "bellingcat path threw");
+    log9.warn({ err }, "bellingcat path threw");
   }
   const hit = resolveViaActionGeoFallback(ctx);
   return { ...hit, provenance: "gdelt-actiongeo-fallback", actionGeoDistanceKm: 0 };
 }
 
 // server/lib/llmEventExtractor.v3.ts
-var log9 = logger.child({ module: "llm-extractor-v3" });
+var log10 = logger.child({ module: "llm-extractor-v3" });
 var BATCH_SIZE = env.LLM_BATCH_SIZE;
 var V3_BAKEOFF_MODEL = process.env.V3_BAKEOFF_MODEL;
 var TEMPORAL_CONTEXT_COUNT = 3;
 var TEMPORAL_CONTEXT_BBOX_DEG = 1;
 var TEMPORAL_CONTEXT_WINDOW_MS = 72 * 36e5;
 var NEWS_MATCH_WINDOW_MS = 24 * 36e5;
-var NEWS_KEY = "news:gdelt";
+var NEWS_KEY = "news:feed";
 var EVENTS_LLM_V3_KEY = "events:llm:v3";
 var SYSTEM_PROMPT_V3 = [
   "You are a conflict event analyst extracting structured data from GDELT event records.",
@@ -3308,7 +3372,7 @@ async function buildPromptContext(group) {
       }
     }
   } catch (err) {
-    log9.warn({ err }, "news cross-match failed, omitting NEWS+BELLINGCAT blocks");
+    log10.warn({ err }, "news cross-match failed, omitting NEWS+BELLINGCAT blocks");
   }
   const temporalEvents = await loadTemporalContext(group);
   return { group, matchedNews, bellingcatHits, temporalEvents };
@@ -3371,7 +3435,7 @@ async function processEventGroupsV3(groups, onBatchComplete) {
           }
         }
       } catch (readErr) {
-        log9.warn(
+        log10.warn(
           {
             cacheKey: cacheKey2,
             err: readErr instanceof Error ? readErr.message : String(readErr)
@@ -3388,7 +3452,7 @@ async function processEventGroupsV3(groups, onBatchComplete) {
           stats.hitCount += 1;
           continue;
         }
-        log9.warn(
+        log10.warn(
           { cacheKey: cacheKey2 },
           "lineage pre-filter cache payload failed v3 reparse; treating as miss"
         );
@@ -3507,7 +3571,7 @@ async function processEventGroupsV3(groups, onBatchComplete) {
             await finishBatch();
             return;
           }
-          log9.warn({ batchIndex }, "v3 batch yielded no content (null or watchdog timeout)");
+          log10.warn({ batchIndex }, "v3 batch yielded no content (null or watchdog timeout)");
           recordFailedBatch();
           await finishBatch();
           return;
@@ -3519,7 +3583,7 @@ async function processEventGroupsV3(groups, onBatchComplete) {
           const errMsg = jsonErr instanceof Error ? jsonErr.message : String(jsonErr);
           const isTruncation = finishReason === "length" || /unterminated string/i.test(errMsg);
           const dlqReason = isTruncation ? "v3:max_tokens_truncation" : "v3:malformed";
-          log9.warn(
+          log10.warn(
             {
               batchIndex,
               jsonErr: errMsg,
@@ -3550,7 +3614,7 @@ async function processEventGroupsV3(groups, onBatchComplete) {
         }
         const validated = batchResponseV3.safeParse(parsed);
         if (!validated.success) {
-          log9.warn(
+          log10.warn(
             { issues: validated.error.issues.slice(0, 3), batchIndex },
             "v3 Zod parse failed"
           );
@@ -3623,7 +3687,7 @@ ${userPrompt}`;
           const recents = (llmProgress.recentEvents ?? []).slice(0, 49);
           updateProgress({ recentEvents: [recentEvent, ...recents] });
         }
-        log9.debug(
+        log10.debug(
           { batchIndex, durationMs: batchDurationMs, events: validated.data.events.length },
           "v3 batch processed"
         );
@@ -3752,7 +3816,7 @@ async function geocodeEnrichedEventsV3(events, groupsByKey, matchedNewsByGroup, 
     try {
       resolved = await resolveLocation(ev.location, ctx);
     } catch (err) {
-      log9.warn(
+      log10.warn(
         { err: err instanceof Error ? err.message : String(err), groupKey: ev.groupKey },
         "resolveLocation threw \u2014 using GDELT centroid fallback for this event"
       );
@@ -3796,7 +3860,7 @@ async function geocodeEnrichedEventsV3(events, groupsByKey, matchedNewsByGroup, 
 
 // server/lib/llmRunHistory.ts
 init_redis();
-var log10 = logger.child({ module: "llm-run-history" });
+var log11 = logger.child({ module: "llm-run-history" });
 var RUNS_KEY = "llm:runs:history";
 var RUNS_MAX = 200;
 var RUNS_TTL_SEC = 30 * 24 * 3600;
@@ -3815,7 +3879,7 @@ async function pushRecord(entry) {
     await redis.ltrim(RUNS_KEY, 0, RUNS_MAX - 1);
     await redis.expire(RUNS_KEY, RUNS_TTL_SEC);
   } catch (err) {
-    log10.warn({ err, runId: entry.runId }, "runHistory push failed");
+    log11.warn({ err, runId: entry.runId }, "runHistory push failed");
   }
 }
 async function openRunRecord(args) {
@@ -3858,7 +3922,7 @@ async function hydrateRunHistoryIfCold() {
 
 // server/lib/llmTokenBudget.ts
 init_redis();
-var log11 = logger.child({ module: "llm-token-budget" });
+var log12 = logger.child({ module: "llm-token-budget" });
 var DAILY_LIMITS = {
   // Phase 29 D-01: cerebras/groq retired from the runtime path (ADR-0010).
   // The slots are retained here for one deploy window so the test suite's
@@ -3930,6 +3994,479 @@ async function prioritizeBySeverity(groups) {
   const paused = await shouldPauseNewEvents();
   if (!paused) return groups;
   return groups.slice().sort((a, b) => computeSeverityScore(b) - computeSeverityScore(a) || b.timestamp - a.timestamp);
+}
+
+// server/adapters/gdelt.ts
+import AdmZip from "adm-zip";
+var log13 = logger.child({ module: "gdelt" });
+var GDELT_LASTUPDATE_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
+var MIDDLE_EAST_FIPS = /* @__PURE__ */ new Set([
+  "IR",
+  // Iran
+  "IZ",
+  // Iraq (FIPS, not ISO "IQ")
+  "SY",
+  // Syria
+  "TU",
+  // Turkey (FIPS, not ISO "TR")
+  "SA",
+  // Saudi Arabia
+  "YM",
+  // Yemen
+  "MU",
+  // Oman
+  "AE",
+  // United Arab Emirates
+  "QA",
+  // Qatar
+  "BA",
+  // Bahrain
+  "KU",
+  // Kuwait
+  "JO",
+  // Jordan
+  "IS",
+  // Israel (FIPS, not ISO "IL")
+  "LE",
+  // Lebanon
+  "AF",
+  // Afghanistan
+  "PK"
+  // Pakistan
+]);
+var CONFLICT_ROOT_CODES = /* @__PURE__ */ new Set(["18", "19", "20"]);
+var COL = {
+  GLOBALEVENTID: 0,
+  SQLDATE: 1,
+  Actor1Name: 6,
+  Actor1CountryCode: 7,
+  Actor2Name: 16,
+  Actor2CountryCode: 17,
+  EventCode: 26,
+  EventBaseCode: 27,
+  EventRootCode: 28,
+  GoldsteinScale: 30,
+  NumMentions: 31,
+  NumSources: 32,
+  ActionGeo_Type: 51,
+  ActionGeo_FullName: 52,
+  ActionGeo_CountryCode: 53,
+  ActionGeo_ADM1Code: 54,
+  ActionGeo_ADM2Code: 55,
+  ActionGeo_Lat: 56,
+  ActionGeo_Long: 57,
+  ActionGeo_FeatureID: 58,
+  SOURCEURL: 60
+};
+async function getExportUrl() {
+  const res = await fetch(GDELT_LASTUPDATE_URL);
+  if (!res.ok) {
+    throw new Error(`GDELT lastupdate.txt failed: ${res.status}`);
+  }
+  const text = await res.text();
+  const lines = text.trim().split("\n");
+  const exportLine = lines.find((l) => l.includes(".export.CSV.zip"));
+  if (!exportLine) {
+    throw new Error("No export URL found in lastupdate.txt");
+  }
+  const parts = exportLine.trim().split(" ");
+  const url = parts[2];
+  if (!url) {
+    throw new Error("Malformed lastupdate.txt: missing URL column");
+  }
+  return url;
+}
+async function downloadAndUnzip(url) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`GDELT export download failed: ${res.status}`);
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const zip = new AdmZip(buffer);
+  const entries = zip.getEntries();
+  const firstEntry = entries[0];
+  if (!firstEntry) {
+    throw new Error("GDELT ZIP archive contained no entries");
+  }
+  return firstEntry.getData().toString("utf8");
+}
+function getCol(cols, idx) {
+  return cols[idx] ?? "";
+}
+var BASE_CODE_MAP = {
+  "181": "targeted",
+  // Abduction / hostage-taking
+  "182": "on_ground",
+  // Physical assault
+  "183": "explosion",
+  // Bombing
+  "184": "on_ground",
+  // Use as human shield
+  "185": "targeted",
+  // Assassination attempt
+  "186": "targeted",
+  // Assassination
+  "190": "on_ground",
+  // Conventional military force
+  "191": "other",
+  // Blockade
+  "193": "on_ground",
+  // Small arms / light weapons
+  "194": "explosion",
+  // Artillery / tank support (shelling)
+  "195": "airstrike",
+  // Aerial weapons
+  "196": "other",
+  // Ceasefire violation
+  "200": "other",
+  // Unconventional mass violence
+  "201": "other",
+  // Mass expulsion
+  "202": "other",
+  // Mass killings
+  "203": "other",
+  // Ethnic cleansing
+  "204": "other"
+  // WMD
+};
+var ROOT_FALLBACK = {
+  "18": "on_ground",
+  "19": "on_ground",
+  "20": "other"
+};
+function classifyByBaseCode(eventBaseCode, eventRootCode) {
+  return BASE_CODE_MAP[eventBaseCode] ?? ROOT_FALLBACK[eventRootCode] ?? "on_ground";
+}
+function parseSqlDate(sqlDate) {
+  const year = parseInt(sqlDate.slice(0, 4), 10);
+  const month = parseInt(sqlDate.slice(4, 6), 10) - 1;
+  const day = parseInt(sqlDate.slice(6, 8), 10);
+  return Date.UTC(year, month, day);
+}
+var BASE_CODE_DESCRIPTIONS = {
+  "180": "Unconventional violence",
+  "181": "Abduction / hostage-taking",
+  "182": "Physical assault",
+  "183": "Bombing",
+  "184": "Use as human shield",
+  "185": "Assassination attempt",
+  "186": "Assassination",
+  "190": "Conventional military force",
+  "191": "Blockade / movement restriction",
+  "193": "Small arms / light weapons",
+  "194": "Artillery / tank support",
+  "195": "Aerial weapons",
+  "196": "Ceasefire violation",
+  "200": "Unconventional mass violence",
+  "201": "Mass expulsion",
+  "202": "Mass killings",
+  "203": "Ethnic cleansing",
+  "204": "Weapons of mass destruction"
+};
+function describeEvent(eventBaseCode) {
+  return BASE_CODE_DESCRIPTIONS[eventBaseCode] ?? "Unknown conflict";
+}
+function actionGeoTypeToPrecision(geoType) {
+  switch (geoType) {
+    case 4:
+      return "exact";
+    // landmark — most precise GDELT geocoding
+    case 3:
+      return "city";
+    // city-level — ~5km uncertainty
+    case 2:
+      return "region";
+    // ADM1/state — ~25km uncertainty
+    case 1:
+      return "region";
+    // country-level — ~25km uncertainty
+    default:
+      return void 0;
+  }
+}
+function normalizeGdeltEvent(cols, lat, lng) {
+  const eventBaseCode = getCol(cols, COL.EventBaseCode);
+  const eventRootCode = getCol(cols, COL.EventRootCode);
+  const eventCode = getCol(cols, COL.EventCode);
+  const sqlDate = getCol(cols, COL.SQLDATE);
+  const actionGeoType = parseInt(getCol(cols, COL.ActionGeo_Type), 10) || void 0;
+  const precision = actionGeoTypeToPrecision(actionGeoType);
+  return {
+    id: `gdelt-${getCol(cols, COL.GLOBALEVENTID)}`,
+    type: classifyByBaseCode(eventBaseCode, eventRootCode),
+    lat,
+    lng,
+    timestamp: parseSqlDate(sqlDate),
+    label: `${getCol(cols, COL.ActionGeo_FullName)}: ${describeEvent(eventBaseCode)}`,
+    data: {
+      eventType: describeEvent(eventBaseCode),
+      subEventType: `CAMEO ${eventCode}`,
+      fatalities: 0,
+      // GDELT does not track fatalities
+      actor1: getCol(cols, COL.Actor1Name),
+      actor2: getCol(cols, COL.Actor2Name),
+      notes: "",
+      source: getCol(cols, COL.SOURCEURL),
+      goldsteinScale: parseFloat(getCol(cols, COL.GoldsteinScale)) || 0,
+      locationName: getCol(cols, COL.ActionGeo_FullName),
+      cameoCode: eventCode,
+      numMentions: parseInt(getCol(cols, COL.NumMentions), 10) || void 0,
+      numSources: parseInt(getCol(cols, COL.NumSources), 10) || void 0,
+      actionGeoType,
+      precision
+    }
+  };
+}
+function parseAndFilter(csv, bellingcatArticles) {
+  const lines = csv.trim().split("\n");
+  const rawCount = lines.length;
+  const config2 = getConfig();
+  const excludedCameo = new Set(config2.eventExcludedCameo);
+  const best = /* @__PURE__ */ new Map();
+  let geoDiscardCount = 0;
+  for (const line of lines) {
+    const cols = line.split("	");
+    if (cols.length < 61) continue;
+    const eventRootCode = getCol(cols, COL.EventRootCode);
+    const countryCode = getCol(cols, COL.ActionGeo_CountryCode);
+    if (!CONFLICT_ROOT_CODES.has(eventRootCode)) continue;
+    const eventBaseCode = getCol(cols, COL.EventBaseCode);
+    if (excludedCameo.has(eventBaseCode)) continue;
+    if (!MIDDLE_EAST_FIPS.has(countryCode)) continue;
+    const fullName = getCol(cols, COL.ActionGeo_FullName);
+    if (!isGeoValid(fullName, countryCode)) {
+      geoDiscardCount++;
+      log13.warn(
+        { eventId: getCol(cols, COL.GLOBALEVENTID), fullName, countryCode },
+        "discarded: FullName contradicts FIPS"
+      );
+      continue;
+    }
+    const numSources = parseInt(getCol(cols, COL.NumSources), 10) || 0;
+    if (numSources < config2.eventMinSources) continue;
+    const actor1Country = getCol(cols, COL.Actor1CountryCode).trim();
+    const actor2Country = getCol(cols, COL.Actor2CountryCode).trim();
+    if (!actor1Country && !actor2Country) continue;
+    const lat = parseFloat(getCol(cols, COL.ActionGeo_Lat));
+    const lng = parseFloat(getCol(cols, COL.ActionGeo_Long));
+    if (isNaN(lat) || isNaN(lng)) continue;
+    const key = `${getCol(cols, COL.SQLDATE)}|${getCol(cols, COL.EventCode)}|${lat}|${lng}`;
+    const mentions = parseInt(getCol(cols, COL.NumMentions), 10) || 0;
+    const existing = best.get(key);
+    if (!existing || mentions > existing.mentions) {
+      best.set(key, { cols, lat, lng, mentions });
+    }
+  }
+  const geoValidCount = best.size;
+  const { eventConfidenceThreshold, eventCentroidPenalty } = config2;
+  let reclassifyCount = 0;
+  let thresholdDiscardCount = 0;
+  const results = [];
+  for (const entry of best.values()) {
+    let entity = normalizeGdeltEvent(entry.cols, entry.lat, entry.lng);
+    const origType = entity.type;
+    entity = applyGoldsteinSanity(entity);
+    if (entity.type !== origType) {
+      reclassifyCount++;
+      const ceiling = GOLDSTEIN_CEILINGS[origType]?.ceiling;
+      log13.info(
+        {
+          id: entity.id,
+          from: origType,
+          to: entity.type,
+          goldstein: entity.data.goldsteinScale,
+          ceiling
+        },
+        "reclassified event"
+      );
+    }
+    const geoPrecision = detectCentroid(entity.lat, entity.lng);
+    entity = { ...entity, data: { ...entity.data, geoPrecision } };
+    let confidence = computeEventConfidence(entity, geoPrecision);
+    const actionGeoType = entity.data.actionGeoType;
+    if (actionGeoType === 3 || actionGeoType === 4) {
+      confidence *= eventCentroidPenalty;
+    }
+    entity = { ...entity, data: { ...entity.data, confidence } };
+    if (confidence < eventConfidenceThreshold) {
+      thresholdDiscardCount++;
+      log13.warn(
+        { id: entity.id, confidence: +confidence.toFixed(3), threshold: eventConfidenceThreshold },
+        "discarded: below confidence threshold"
+      );
+      continue;
+    }
+    if (bellingcatArticles && bellingcatArticles.length > 0) {
+      const corroboration = checkBellingcatCorroboration(entity, bellingcatArticles);
+      if (corroboration.matched) {
+        confidence = Math.min(1, confidence + config2.bellingcatCorroborationBoost);
+        entity = { ...entity, data: { ...entity.data, confidence } };
+        log13.info(
+          {
+            id: entity.id,
+            boost: config2.bellingcatCorroborationBoost,
+            confidence: +confidence.toFixed(3),
+            article: corroboration.article.url
+          },
+          "Bellingcat corroboration boost"
+        );
+      }
+    }
+    results.push(entity);
+  }
+  log13.info(
+    {
+      rawCount,
+      geoValidCount,
+      geoDiscardCount,
+      reclassifyCount,
+      aboveThreshold: geoValidCount - thresholdDiscardCount,
+      finalCount: results.length
+    },
+    "pipeline summary"
+  );
+  return results;
+}
+async function fetchEvents(bellingcatArticles) {
+  const start = Date.now();
+  const exportUrl = await getExportUrl();
+  const csv = await downloadAndUnzip(exportUrl);
+  const events = parseAndFilter(csv, bellingcatArticles);
+  log13.info({ count: events.length, durationMs: Date.now() - start }, "fetched events");
+  return events;
+}
+function generateBackfillUrls(fromTs, toTs, intervalMs) {
+  const urls = [];
+  const interval = intervalMs ?? 6 * 60 * 60 * 1e3;
+  const start = new Date(fromTs);
+  start.setUTCHours(0, 0, 0, 0);
+  let cursor = start.getTime();
+  while (cursor <= toTs) {
+    const d = new Date(cursor);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    urls.push(`http://data.gdeltproject.org/gdeltv2/${yyyy}${mm}${dd}${hh}0000.export.CSV.zip`);
+    cursor += interval;
+  }
+  return urls;
+}
+async function backfillEvents(days) {
+  const toTs = Date.now();
+  const fromTs = toTs - days * 24 * 60 * 60 * 1e3;
+  const start = Date.now();
+  const urls = generateBackfillUrls(fromTs, toTs);
+  log13.info({ fileCount: urls.length, days, sampling: "4/day" }, "backfill started");
+  const merged = /* @__PURE__ */ new Map();
+  const BATCH_SIZE3 = 5;
+  for (let i = 0; i < urls.length; i += BATCH_SIZE3) {
+    const batch = urls.slice(i, i + BATCH_SIZE3);
+    const results = await Promise.allSettled(
+      batch.map(async (url) => {
+        const csv = await downloadAndUnzip(url);
+        return parseAndFilter(csv);
+      })
+    );
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        for (const e of result.value) {
+          if (!merged.has(e.id)) {
+            merged.set(e.id, e);
+          }
+        }
+      }
+    }
+  }
+  const events = Array.from(merged.values());
+  log13.info(
+    { count: events.length, fileCount: urls.length, durationMs: Date.now() - start },
+    "backfill complete"
+  );
+  return events;
+}
+
+// server/lib/rawEventsRefresh.ts
+init_redis();
+var log14 = logger.child({ module: "raw-events-refresh" });
+var EVENTS_KEY = "events:gdelt";
+var EVENTS_LOGICAL_TTL_MS = 9e5;
+var EVENTS_REDIS_TTL_SEC = 9e3;
+var BACKFILL_KEY = "events:backfill-ts";
+var BACKFILL_COOLDOWN_MS = 36e5;
+async function shouldBackfill() {
+  try {
+    const lastTs = await redis.get(BACKFILL_KEY);
+    if (lastTs === null || lastTs === void 0) return true;
+    return Date.now() - lastTs > BACKFILL_COOLDOWN_MS;
+  } catch {
+    return true;
+  }
+}
+async function recordBackfillTimestamp() {
+  try {
+    await redis.set(BACKFILL_KEY, Date.now(), { ex: EVENTS_REDIS_TTL_SEC });
+  } catch {
+  }
+}
+async function refreshRawEvents(opts) {
+  const { cached, forceBackfill = false, skipBackfill = false } = opts;
+  let bellingcatArticles = [];
+  try {
+    const newsCache = await cacheGetSafe("news:feed", 0);
+    if (newsCache?.data) {
+      bellingcatArticles = newsCache.data.flatMap((cluster) => cluster.articles).filter((a) => a.source === "Bellingcat").map((a) => ({
+        title: a.title,
+        url: a.url,
+        publishedAt: a.publishedAt,
+        ...extractBellingcatGeo(a.title)
+      }));
+    }
+  } catch {
+    log14.warn("failed to fetch Bellingcat articles for corroboration");
+  }
+  const fresh = await fetchEvents(bellingcatArticles);
+  const eventMap = /* @__PURE__ */ new Map();
+  if (cached) {
+    for (const event of cached.data) {
+      eventMap.set(event.id, event);
+    }
+  }
+  if (!skipBackfill && (!cached || forceBackfill) && (forceBackfill || await shouldBackfill())) {
+    try {
+      const backfillDays = Math.ceil((Date.now() - WAR_START) / 864e5);
+      const backfillData = await backfillEvents(backfillDays);
+      for (const event of backfillData) {
+        eventMap.set(event.id, event);
+      }
+      await recordBackfillTimestamp();
+      log14.info({ count: backfillData.length }, "backfill: merged historical events");
+    } catch (backfillErr) {
+      log14.warn({ err: backfillErr }, "backfill failed (non-fatal)");
+    }
+  }
+  for (const event of fresh) {
+    eventMap.set(event.id, event);
+  }
+  for (const [id, event] of eventMap) {
+    if (event.timestamp < WAR_START) {
+      eventMap.delete(id);
+    }
+  }
+  const merged = Array.from(eventMap.values());
+  for (const event of merged) {
+    if (event.data.sourceTier === void 0 && event.data.source) {
+      const domain = extractDomain(event.data.source);
+      const tier = domain ? getSourceTier("", domain) : null;
+      if (tier !== null) {
+        event.data.sourceTier = tier;
+      }
+    }
+  }
+  if (!(skipBackfill && !cached)) {
+    await cacheSetSafe(EVENTS_KEY, merged, EVENTS_REDIS_TTL_SEC);
+  }
+  return merged;
 }
 
 // server/lib/relevanceScorer.ts
@@ -4128,7 +4665,7 @@ function computeCompositeScore(input) {
 
 // server/lib/safeWaitUntil.ts
 import { waitUntil } from "@vercel/functions";
-var log12 = logger.child({ module: "safeWaitUntil" });
+var log15 = logger.child({ module: "safeWaitUntil" });
 var VERCEL_CTX = /* @__PURE__ */ Symbol.for("@vercel/request-context");
 function safeWaitUntil(promise) {
   const hasVercelContext = typeof globalThis[VERCEL_CTX] !== "undefined";
@@ -4136,17 +4673,17 @@ function safeWaitUntil(promise) {
     try {
       waitUntil(promise);
     } catch (vercelErr) {
-      log12.warn(
+      log15.warn(
         { err: vercelErr },
         "waitUntil threw on Vercel runtime; falling back to local catch"
       );
       promise.catch((err) => {
-        log12.warn({ err }, "safeWaitUntil-fallback IIFE rejected (after Vercel-path throw)");
+        log15.warn({ err }, "safeWaitUntil-fallback IIFE rejected (after Vercel-path throw)");
       });
     }
   } else {
     promise.catch((err) => {
-      log12.warn({ err }, "safeWaitUntil-fallback IIFE rejected (local dev)");
+      log15.warn({ err }, "safeWaitUntil-fallback IIFE rejected (local dev)");
     });
   }
 }
@@ -4158,7 +4695,7 @@ import { z as z4 } from "zod";
 // server/lib/operatorAudit.ts
 init_redis();
 import { createHash } from "crypto";
-var log13 = logger.child({ module: "operatorAudit" });
+var log16 = logger.child({ module: "operatorAudit" });
 var OPERATOR_AUDIT_KEY = "operator:audit-log";
 var AUDIT_MAX_ENTRIES = 500;
 var AUDIT_TTL_SEC = 30 * 86400;
@@ -4188,32 +4725,58 @@ async function appendOperatorAuditEntry(entry) {
       }
     }
   } catch (err) {
-    log13.error({ err, operation: entry.operation }, "operator-audit-log write failed");
+    log16.error({ err, operation: entry.operation }, "operator-audit-log write failed");
   }
 }
 
 // server/lib/urlLiveness.ts
 var URL_LIVENESS_KEY_PREFIX = "events:url-liveness:";
 var URL_LIVENESS_COUNT_KEY = "events:url-liveness-count";
-var UrlLivenessStatusSchema = z4.enum(["live", "404", "403", "dead-host", "unknown"]);
+var UrlLivenessStatusSchema = z4.enum([
+  "live",
+  "404",
+  "403",
+  "dead-host",
+  "unknown",
+  "soft-404",
+  "no-url"
+]);
 var UrlLivenessSchema = z4.object({
   status: UrlLivenessStatusSchema,
   lastProbedAt: z4.string().datetime(),
   /**
-   * D-12 + 32-RESEARCH.md A2 — monotonic-with-reset-on-live-or-unknown
-   * transition. Increment ONLY when the latest probe status is
-   * terminal-dead AND the prior stored status was also terminal-dead
-   * (or no prior). Reset to 0 on any `live` or `unknown` transition.
+   * Phase 32 D-12 / 32-RESEARCH.md A2 origin: monotonic-with-reset on
+   * any non-dead transition. Phase 43 D-10 AMENDS this: `live` resets to
+   * 0; `unknown` PRESERVES the prior count (a transient blip must not
+   * erase an accumulating terminal-dead run); `dead→dead` increments.
+   * The "≥3 consecutive terminal-dead ticks" cron auto-prune gate
+   * (D-12) therefore survives a single intervening `unknown` tick.
    *
-   * Pure-monotonic accumulation would conflate dead→live→dead with
-   * three-in-a-row-dead and falsely trigger D-12's cron auto-prune
-   * `attemptCount >= 3` gate. The monotonic-with-reset rule makes the
-   * "≥3 consecutive terminal-dead ticks" semantics a one-line check
-   * inside the probe writer (Plan 32-02 Task 3).
+   * Increment ONLY when the latest probe status is terminal-dead AND
+   * the prior stored status was also terminal-dead (or first-write
+   * dead → start at 1). `no-url` resets to 0 (it is not a dead run).
    */
   attemptCount: z4.number().int().nonnegative(),
-  lastUrlProbed: z4.string().url(),
-  lastHttpStatus: z4.number().int().nullable()
+  /**
+   * D-07 — nullable so a `no-url` entry (event has no primary URL to
+   * probe) can record `lastUrlProbed: null`. All other statuses carry
+   * the probed URL string.
+   */
+  lastUrlProbed: z4.string().url().nullable(),
+  lastHttpStatus: z4.number().int().nullable(),
+  /**
+   * D-16 — required-but-nullable provenance string (≤200 chars).
+   * Carries the body/redirect heuristic that produced a `soft-404`
+   * verdict (e.g. `'soft-404: matched "page not found" in title'`),
+   * the status-code literal for hard 4xx (`'http-404'`, `'http-403'`),
+   * the dead-host reason (`'dead-host: fetch failed'`), or `null` for
+   * `live`/`unknown`/`no-url` verdicts with no body evidence yet.
+   * Required so the writer always carries it; nullable so status-only
+   * verdicts need no synthetic prose. Old Phase 32 entries lacking this
+   * field are read via TS-generic cast (no runtime re-parse) and surface
+   * as `undefined`/`null` safely (T-43-01 accept).
+   */
+  evidence: z4.string().max(200).nullable()
 }).strict();
 var TTL_SEC_BY_STATUS = {
   live: 7 * 24 * 3600,
@@ -4224,19 +4787,71 @@ var TTL_SEC_BY_STATUS = {
   // D-20: 24 hours
   "dead-host": 24 * 3600,
   // D-20: 24 hours
-  unknown: 3600
-  // D-20: 1 hour
+  unknown: 24 * 3600,
+  // WR-02: 24 hours (raised from 1h — must survive the daily sweep gap)
+  "soft-404": 24 * 3600,
+  // D-04/D-09: 24 hours (terminal-dead tier)
+  "no-url": 24 * 3600
+  // D-04/D-09: 24 hours (re-confirm no-url daily)
 };
 function ttlSecForStatus(status) {
   return TTL_SEC_BY_STATUS[status];
 }
-var log14 = logger.child({ module: "urlLiveness" });
+var log17 = logger.child({ module: "urlLiveness" });
 var PROBE_CONCURRENCY = 8;
 var PROBE_TIMEOUT_MS = 1e4;
 var PER_HOST_INTERVAL_MS = 1e3;
 var JITTER_MS2 = 200;
 var MAX_REDIRECTS = 3;
 var PROBE_UA = "IranMonitor-LinkCheck/1.0 (+https://otg-iran-monitor.vercel.app)";
+var SOFT404_BODY_CAP_BYTES = 16384;
+var NEAR_EMPTY_FLOOR_BYTES = 512;
+var NOT_FOUND_MARKERS = [
+  // CR-03 — every entry must be an error-context phrase that cannot occur in a
+  // live conflict-news <title>. The bare substrings `'404'`, `'not found'`, and
+  // `'no longer exists'` were DROPPED because they deterministically match live
+  // headlines in THIS corpus: `'404'` hits Persian Solar-Hijri years (SH 1404 =
+  // Mar 2025–Mar 2026) + hardware (GE F404) + flight/casualty numbers;
+  // `'not found'` hits "Missing sailors not found after strike"; `'no longer
+  // exists'` hits "Hamas says the ceasefire no longer exists". Each survivor
+  // below requires the error framing ("page"/"article"/"content"/"error 404"/
+  // "404 not found"/"http 404"/"this page no longer exists") so a live article
+  // title cannot match. Precision-first (D-03); expanding later is cheap.
+  "page not found",
+  "article not available",
+  "page no longer available",
+  "content not found",
+  "this page no longer exists",
+  "error 404",
+  "404 not found",
+  "http 404"
+];
+function classifySoft404(bodyText, finalUrl, originalUrl) {
+  const title = (/<title[^>]*>([^<]*)<\/title>/i.exec(bodyText)?.[1] ?? "").toLowerCase();
+  for (const marker of NOT_FOUND_MARKERS) {
+    if (title.includes(marker)) {
+      return { soft404: true, evidence: `soft-404: matched "${marker}" in title` };
+    }
+  }
+  try {
+    const origDepth = new URL(originalUrl).pathname.split("/").filter(Boolean).length;
+    const finalPath = new URL(finalUrl).pathname;
+    const finalDepth = finalPath.split("/").filter(Boolean).length;
+    if (origDepth >= 2 && finalDepth <= 1) {
+      return {
+        soft404: true,
+        evidence: `redirect-to-home: ${new URL(originalUrl).pathname} \u2192 ${finalPath}`
+      };
+    }
+  } catch {
+  }
+  const contentLen = bodyText.replace(/<[^>]+>/g, "").trim().length;
+  const hasScript = /<script[\s>]/i.test(bodyText);
+  if (contentLen < NEAR_EMPTY_FLOOR_BYTES && !hasScript) {
+    return { soft404: true, evidence: `near-empty: ${contentLen} bytes` };
+  }
+  return { soft404: false, evidence: null };
+}
 var SWEEP_SAFETY_MARGIN_MS = 6e4;
 var PRIVATE_HOST_REGEX = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.)/i;
 function isPrivateHost(hostname) {
@@ -4249,12 +4864,12 @@ function isPrivateHost(hostname) {
   if (/^f[cd][0-9a-f]{2}:/i.test(h)) return true;
   return false;
 }
-async function fetchOnce(url, method) {
+async function fetchOnce(url, method, rangeBytes = 1024) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {
     const headers = { "User-Agent": PROBE_UA };
-    if (method === "GET") headers.Range = "bytes=0-1023";
+    if (method === "GET") headers.Range = `bytes=0-${rangeBytes - 1}`;
     return await fetch(url, {
       method,
       headers,
@@ -4267,72 +4882,154 @@ async function fetchOnce(url, method) {
     clearTimeout(timer);
   }
 }
+async function readCappedBody(res, maxBytes) {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {
+    });
+  }
+  const merged = new Uint8Array(total);
+  let pos = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, pos);
+    pos += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(merged.subarray(0, maxBytes));
+}
+async function classifyTwoHundred(finalUrl, originalUrl, httpStatus) {
+  const liveVerdict = {
+    status: "live",
+    httpStatus,
+    finalUrl,
+    evidence: null
+  };
+  try {
+    try {
+      await waitForHostSlot(new URL(finalUrl).hostname);
+    } catch {
+    }
+    const res = await fetchOnce(finalUrl, "GET", SOFT404_BODY_CAP_BYTES);
+    if (res === null) {
+      return liveVerdict;
+    }
+    if (res.status < 200 || res.status >= 300) {
+      log17.info(
+        { finalUrl, getStatus: res.status, headStatus: httpStatus },
+        "soft-404 body GET non-2xx where HEAD was 200 \u2014 no body signal, returning live"
+      );
+      await res.body?.cancel().catch(() => {
+      });
+      return liveVerdict;
+    }
+    const body = await readCappedBody(res, SOFT404_BODY_CAP_BYTES);
+    const verdict = classifySoft404(body, finalUrl, originalUrl);
+    if (verdict.soft404) {
+      return { status: "soft-404", httpStatus, finalUrl, evidence: verdict.evidence };
+    }
+    return liveVerdict;
+  } catch (err) {
+    log17.warn({ err, finalUrl }, "soft-404 body classification failed (degrade-open to live)");
+    return liveVerdict;
+  }
+}
 async function probeUrl(rawUrl) {
   let parsed;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    return { status: "dead-host", httpStatus: null, finalUrl: rawUrl };
+    return {
+      status: "dead-host",
+      httpStatus: null,
+      finalUrl: rawUrl,
+      evidence: "dead-host: fetch failed"
+    };
   }
   if (isPrivateHost(parsed.hostname)) {
-    log14.warn({ rawUrl }, "probe target rejected by SSRF guard");
-    return { status: "unknown", httpStatus: null, finalUrl: rawUrl };
+    log17.warn({ rawUrl }, "probe target rejected by SSRF guard");
+    return { status: "unknown", httpStatus: null, finalUrl: rawUrl, evidence: null };
   }
   let currentUrl = rawUrl;
   try {
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
       let res = await fetchOnce(currentUrl, "HEAD");
       if (res === null) {
-        return { status: "dead-host", httpStatus: null, finalUrl: currentUrl };
+        return {
+          status: "dead-host",
+          httpStatus: null,
+          finalUrl: currentUrl,
+          evidence: "dead-host: fetch failed"
+        };
       }
       if (res.status === 405) {
         res = await fetchOnce(currentUrl, "GET");
         if (res === null) {
-          return { status: "dead-host", httpStatus: null, finalUrl: currentUrl };
+          return {
+            status: "dead-host",
+            httpStatus: null,
+            finalUrl: currentUrl,
+            evidence: "dead-host: fetch failed"
+          };
         }
       }
       const code = res.status;
       if (code >= 200 && code < 300) {
-        return { status: "live", httpStatus: code, finalUrl: currentUrl };
+        return await classifyTwoHundred(currentUrl, rawUrl, code);
       }
       if (code === 404) {
-        return { status: "404", httpStatus: 404, finalUrl: currentUrl };
+        return { status: "404", httpStatus: 404, finalUrl: currentUrl, evidence: "http-404" };
       }
       if (code === 403) {
-        return { status: "403", httpStatus: 403, finalUrl: currentUrl };
+        return { status: "403", httpStatus: 403, finalUrl: currentUrl, evidence: "http-403" };
       }
       if (code >= 300 && code < 400) {
         if (hop >= MAX_REDIRECTS) {
-          return { status: "unknown", httpStatus: code, finalUrl: currentUrl };
+          return { status: "unknown", httpStatus: code, finalUrl: currentUrl, evidence: null };
         }
         const location = res.headers.get("location");
         if (!location) {
-          return { status: "unknown", httpStatus: code, finalUrl: currentUrl };
+          return { status: "unknown", httpStatus: code, finalUrl: currentUrl, evidence: null };
         }
         try {
           currentUrl = new URL(location, currentUrl).toString();
         } catch {
-          return { status: "unknown", httpStatus: code, finalUrl: currentUrl };
+          return { status: "unknown", httpStatus: code, finalUrl: currentUrl, evidence: null };
         }
         try {
           if (isPrivateHost(new URL(currentUrl).hostname)) {
-            log14.warn(
+            log17.warn(
               { rawUrl, redirectTarget: currentUrl },
               "redirect target rejected by SSRF guard"
             );
-            return { status: "unknown", httpStatus: code, finalUrl: currentUrl };
+            return { status: "unknown", httpStatus: code, finalUrl: currentUrl, evidence: null };
           }
         } catch {
-          return { status: "unknown", httpStatus: code, finalUrl: currentUrl };
+          return { status: "unknown", httpStatus: code, finalUrl: currentUrl, evidence: null };
         }
         continue;
       }
-      return { status: "unknown", httpStatus: code, finalUrl: currentUrl };
+      return { status: "unknown", httpStatus: code, finalUrl: currentUrl, evidence: null };
     }
-    return { status: "unknown", httpStatus: null, finalUrl: currentUrl };
+    return { status: "unknown", httpStatus: null, finalUrl: currentUrl, evidence: null };
   } catch (err) {
-    log14.warn({ err, rawUrl }, "probeUrl unexpected throw");
-    return { status: "dead-host", httpStatus: null, finalUrl: currentUrl };
+    log17.warn({ err, rawUrl }, "probeUrl unexpected throw");
+    return {
+      status: "dead-host",
+      httpStatus: null,
+      finalUrl: currentUrl,
+      evidence: "dead-host: fetch failed"
+    };
   }
 }
 var hostNext = /* @__PURE__ */ new Map();
@@ -4354,7 +5051,7 @@ function pruneStaleHostSlots() {
   }
 }
 function isTerminalDead(status) {
-  return status === "404" || status === "403" || status === "dead-host";
+  return status === "404" || status === "403" || status === "dead-host" || status === "soft-404";
 }
 var LIVENESS_READ_LOGICAL_TTL_MS = 999999999;
 async function persistLiveness(eventId, urlProbed, probeResult) {
@@ -4364,7 +5061,11 @@ async function persistLiveness(eventId, urlProbed, probeResult) {
   const nextDead = isTerminalDead(probeResult.status);
   const priorDead = prior !== null && isTerminalDead(prior.status);
   let attemptCount;
-  if (!nextDead) {
+  if (probeResult.status === "live") {
+    attemptCount = 0;
+  } else if (probeResult.status === "unknown") {
+    attemptCount = prior?.attemptCount ?? 0;
+  } else if (probeResult.status === "no-url") {
     attemptCount = 0;
   } else if (priorDead) {
     attemptCount = prior.attemptCount + 1;
@@ -4376,7 +5077,18 @@ async function persistLiveness(eventId, urlProbed, probeResult) {
     lastProbedAt: (/* @__PURE__ */ new Date()).toISOString(),
     attemptCount,
     lastUrlProbed: urlProbed,
-    lastHttpStatus: probeResult.httpStatus
+    lastHttpStatus: probeResult.httpStatus,
+    // D-16/D-17 — writer always carries the probe's evidence string
+    // (null for status-only verdicts). WR-01 — truncate to 200 chars at this
+    // single writer choke point BEFORE the `.strict()` parse below. The
+    // redirect-to-home evidence embeds two verbatim pathnames; percent-encoded
+    // Persian/Arabic news slugs (this corpus is Middle-East-outlet dominated)
+    // routinely exceed the schema's `z.string().max(200)`, and an over-length
+    // string makes `UrlLivenessSchema.parse` THROW — which would silently drop
+    // this event's liveness write every sweep (it stays Tier A forever and can
+    // never accumulate attemptCount≥3 to be pruned). Truncating here guarantees
+    // persistLiveness never throws on a long evidence string.
+    evidence: probeResult.evidence === null ? null : probeResult.evidence.slice(0, 200)
   };
   UrlLivenessSchema.parse(next);
   await cacheSetSafe(key, next, ttlSecForStatus(next.status));
@@ -4390,7 +5102,30 @@ async function persistLiveness(eventId, urlProbed, probeResult) {
       }
     }
   } catch (err) {
-    log14.warn({ err, eventId, priorDead, nextDead }, "sidecar count update failed (degrade-open)");
+    log17.warn({ err, eventId, priorDead, nextDead }, "sidecar count update failed (degrade-open)");
+  }
+}
+async function reconcileDeadUrlCount() {
+  try {
+    let cursor = "0";
+    let terminalDead = 0;
+    do {
+      const reply = await redis.scan(cursor, {
+        match: `${URL_LIVENESS_KEY_PREFIX}*`,
+        count: 200
+      });
+      cursor = reply[0];
+      for (const key of reply[1]) {
+        const cached = await cacheGetSafe(key, LIVENESS_READ_LOGICAL_TTL_MS);
+        const entry = cached?.data ?? null;
+        if (entry && isTerminalDead(entry.status)) terminalDead++;
+      }
+    } while (cursor !== "0" && cursor !== 0);
+    await redis.set(URL_LIVENESS_COUNT_KEY, terminalDead);
+    return terminalDead;
+  } catch (err) {
+    log17.warn({ err }, "reconcileDeadUrlCount failed (degrade-open)");
+    return null;
   }
 }
 var V3_READ_LOGICAL_TTL_MS = 999999999;
@@ -4401,13 +5136,25 @@ async function buildProbeCandidates() {
   );
   const entities = v3?.data ?? [];
   if (!Array.isArray(entities) || entities.length === 0) {
-    return [];
+    return { candidates: [], classifiedNoUrl: 0 };
   }
   const tierA = [];
   const tierB = [];
+  let classifiedNoUrl = 0;
   for (const entity of entities) {
     const url = entity?.data?.source;
     if (!url || typeof url !== "string" || url.length === 0) {
+      classifiedNoUrl++;
+      try {
+        await persistLiveness(entity.id, null, {
+          status: "no-url",
+          httpStatus: null,
+          finalUrl: "",
+          evidence: "no-url: event has no source URL"
+        });
+      } catch (err) {
+        log17.warn({ err, eventId: entity?.id }, "no-url liveness write failed (degrade-open)");
+      }
       continue;
     }
     const prior = await cacheGetSafe(
@@ -4425,7 +5172,10 @@ async function buildProbeCandidates() {
     }
   }
   tierB.sort((a, b) => a.lastProbedAt.localeCompare(b.lastProbedAt));
-  return [...tierA, ...tierB.map(({ eventId, url }) => ({ eventId, url }))];
+  return {
+    candidates: [...tierA, ...tierB.map(({ eventId, url }) => ({ eventId, url }))],
+    classifiedNoUrl
+  };
 }
 async function runProbeSweep(opts) {
   const limit = createLimit(PROBE_CONCURRENCY);
@@ -4448,12 +5198,13 @@ async function runProbeSweep(opts) {
         await persistLiveness(eventId, url, result);
         probed++;
       } catch (err) {
-        log14.warn({ err, eventId, url }, "probe sweep task failed");
+        log17.warn({ err, eventId, url }, "probe sweep task failed");
       }
     })
   );
   await Promise.all(tasks);
   pruneStaleHostSlots();
+  await reconcileDeadUrlCount();
   return { probed, skippedBudget };
 }
 var PRUNE_READ_LOGICAL_TTL_MS = 999999999;
@@ -4477,6 +5228,7 @@ async function pruneDeadUrlEvents(opts) {
     for (const key of reply[1]) livenessKeys.push(key);
   } while (cursor !== "0" && cursor !== 0);
   const prunedIds = [];
+  let terminalDeadFound = 0;
   for (const key of livenessKeys) {
     const eventId = key.startsWith(URL_LIVENESS_KEY_PREFIX) ? key.slice(URL_LIVENESS_KEY_PREFIX.length) : null;
     if (!eventId) continue;
@@ -4484,10 +5236,17 @@ async function pruneDeadUrlEvents(opts) {
     const entry = cached?.data ?? null;
     if (!entry) continue;
     if (!isTerminalDead(entry.status)) continue;
+    terminalDeadFound++;
+    if (opts.trigger === "cron" && entry.status === "403") continue;
     if (opts.trigger === "cron" && entry.attemptCount < 3) continue;
     prunedIds.push(eventId);
   }
   if (prunedIds.length === 0) {
+    try {
+      await redis.set(URL_LIVENESS_COUNT_KEY, terminalDeadFound);
+    } catch (err) {
+      log17.warn({ err, terminalDeadFound }, "sidecar reconcile failed (degrade-open)");
+    }
     await appendOperatorAuditEntry({
       timestamp: Date.now(),
       bearerFingerprint: opts.trigger === "cron" ? "cron:refresh-events" : opts.fingerprint ?? "unknown",
@@ -4502,13 +5261,11 @@ async function pruneDeadUrlEvents(opts) {
   await cacheSetSafe(LLM_EVENTS_KEY_ACTIVE, spliced, LLM_TERMINAL_TTL_SEC);
   const keysToDelete = prunedIds.map((id) => `${URL_LIVENESS_KEY_PREFIX}${id}`);
   await redis.del(...keysToDelete);
+  const reconciledCount = Math.max(0, terminalDeadFound - prunedIds.length);
   try {
-    const after = await redis.decrby(URL_LIVENESS_COUNT_KEY, prunedIds.length);
-    if (typeof after === "number" && after < 0) {
-      await redis.set(URL_LIVENESS_COUNT_KEY, 0);
-    }
+    await redis.set(URL_LIVENESS_COUNT_KEY, reconciledCount);
   } catch (err) {
-    log14.warn({ err, prunedCount: prunedIds.length }, "sidecar DECRBY failed (degrade-open)");
+    log17.warn({ err, reconciledCount }, "sidecar reconcile failed (degrade-open)");
   }
   await appendOperatorAuditEntry({
     timestamp: Date.now(),
@@ -4521,14 +5278,13 @@ async function pruneDeadUrlEvents(opts) {
     },
     result: "ok"
   });
-  log14.info({ trigger: opts.trigger, prunedCount: prunedIds.length }, "pruneDeadUrlEvents complete");
+  log17.info({ trigger: opts.trigger, prunedCount: prunedIds.length }, "pruneDeadUrlEvents complete");
   return { prunedCount: prunedIds.length, prunedIds };
 }
 var __test__ = process.env.NODE_ENV === "test" ? { waitForHostSlot, pruneStaleHostSlots, hostNext, persistLiveness } : void 0;
 
 // server/lib/llmExtractionPipeline.ts
-var log15 = logger.child({ module: "llm-extraction-pipeline" });
-var EVENTS_KEY = "events:gdelt";
+var log18 = logger.child({ module: "llm-extraction-pipeline" });
 var LLM_EVENTS_KEY_ACTIVE = "events:llm:v3";
 var LLM_SUMMARY_KEY_ACTIVE = "events:llm-summary:v3";
 var LLM_PROCESS_KEY = "events:llm-process-ts";
@@ -4546,7 +5302,7 @@ async function mergeAndPersistLlmEntities(newlyEnriched, llmCachedRef, key) {
   const llmMerged = Array.from(llmMergeMap.values());
   await cacheSetSafe(key, llmMerged, LLM_TERMINAL_TTL_SEC);
   saveDevLLMCacheV2(llmMerged);
-  log15.info(
+  log18.info(
     { count: newlyEnriched.length, total: llmMerged.length },
     "LLM: persisted enriched events to terminal cache (Plan 01 helper)"
   );
@@ -4578,14 +5334,22 @@ async function runRefreshExtraction(opts) {
   }
   let rawCached = null;
   try {
-    rawCached = await cacheGetSafe(EVENTS_KEY, 999999999);
+    rawCached = await cacheGetSafe(EVENTS_KEY, EVENTS_LOGICAL_TTL_MS);
   } catch {
     rawCached = null;
   }
-  if (!rawCached?.data || rawCached.data.length === 0) {
+  let merged = rawCached?.data ?? [];
+  if (merged.length === 0 || rawCached?.stale) {
+    try {
+      merged = await refreshRawEvents({ cached: rawCached, skipBackfill: true });
+      log18.info({ count: merged.length }, "cron: refreshed raw GDELT cache before extraction");
+    } catch (err) {
+      log18.warn({ err }, "cron: raw GDELT refresh failed; using cached rows if any");
+    }
+  }
+  if (merged.length === 0) {
     return { dispatched: false, reason: "no_raw_events", schemaVersion: "v3" };
   }
-  const merged = rawCached.data;
   if (llmProgress.stage !== "idle" && llmProgress.stage !== "done" && llmProgress.stage !== "error") {
     return { dispatched: false, reason: "pipeline_busy", schemaVersion: "v3" };
   }
@@ -4648,7 +5412,7 @@ async function runRefreshExtraction(opts) {
         const newGroups = cachedLlmKeys.size > 0 ? groups.filter((g) => !cachedLlmKeys.has(`llm-v3-${g.key}`)) : groups;
         updateProgress({ newGroups: newGroups.length });
         if (newGroups.length === 0) {
-          log15.info("LLM: no new groups to process");
+          log18.info("LLM: no new groups to process");
           runOutcome = "completed";
           updateProgress({
             stage: "done",
@@ -4663,7 +5427,7 @@ async function runRefreshExtraction(opts) {
         }
         const paused = await shouldPauseNewEvents();
         if (paused) {
-          log15.info("LLM_PAUSED_SOFT_CAP");
+          log18.info("LLM_PAUSED_SOFT_CAP");
           runOutcome = "budget_hit";
           updateProgress({
             stage: "done",
@@ -4689,7 +5453,7 @@ async function runRefreshExtraction(opts) {
           }
         );
         if (!extractResult.events || extractResult.events.length === 0) {
-          log15.warn("LLM processing returned null \u2014 raw GDELT serving continues");
+          log18.warn("LLM processing returned null \u2014 raw GDELT serving continues");
           runOutcome = "error";
           updateProgress({
             stage: "error",
@@ -4728,13 +5492,13 @@ async function runRefreshExtraction(opts) {
         try {
           const evalScore = await runEval();
           updateProgress({ evalScore });
-          log15.info({ evalScore, schemaVersion: "v3" }, "eval harness completed");
+          log18.info({ evalScore, schemaVersion: "v3" }, "eval harness completed");
         } catch (evalErr) {
-          log15.warn({ err: evalErr }, "eval harness threw; continuing pipeline");
+          log18.warn({ err: evalErr }, "eval harness threw; continuing pipeline");
         }
         let newsClusters;
         try {
-          const newsCache = await cacheGetSafe("news:gdelt", 0);
+          const newsCache = await cacheGetSafe("news:feed", 0);
           if (newsCache?.data) newsClusters = newsCache.data;
         } catch {
         }
@@ -4762,34 +5526,40 @@ async function runRefreshExtraction(opts) {
           await cacheSetSafe(LLM_SUMMARY_KEY_ACTIVE, buildSummary(), LLM_SUMMARY_TTL_SEC);
         } catch {
         }
-        log15.warn({ err: llmErr }, "LLM background processing failed");
+        log18.warn({ err: llmErr }, "LLM background processing failed");
       } finally {
         await closeRunRecord(await buildRunHistoryEntry(runOutcome));
         try {
           const deadlineMs = cronStart + 8e5 - SWEEP_SAFETY_MARGIN_MS;
-          const candidates = await buildProbeCandidates();
+          const { candidates, classifiedNoUrl } = await buildProbeCandidates();
           const sweep = await runProbeSweep({
             eventIdsWithUrls: candidates,
             deadlineMs
           });
-          log15.info(
-            { probed: sweep.probed, skippedBudget: sweep.skippedBudget },
+          log18.info(
+            {
+              probed: sweep.probed,
+              skippedBudget: sweep.skippedBudget,
+              // Phase 43 GHOST-07 (D-09) — full coverage accounting: how many
+              // events were classified `no-url` (source-less, no fetch issued).
+              classifiedNoUrl
+            },
             "phase 32 probe sweep complete"
           );
           if (Date.now() < deadlineMs) {
             const pruneResult = await pruneDeadUrlEvents({ trigger: "cron" });
-            log15.info(
+            log18.info(
               { prunedCount: pruneResult.prunedCount, prunedIds: pruneResult.prunedIds },
               "phase 32 cron auto-prune complete"
             );
           } else {
-            log15.warn(
+            log18.warn(
               { deadlineMs, now: Date.now() },
               "phase 32 deadline elapsed; skipping cron auto-prune for this tick"
             );
           }
         } catch (probePruneErr) {
-          log15.error({ err: probePruneErr }, "phase 32 probe/prune post-step failed");
+          log18.error({ err: probePruneErr }, "phase 32 probe/prune post-step failed");
         }
       }
     })()
@@ -4867,10 +5637,10 @@ function enrichedV3ToEntities(geocoded, groups, newsClusters) {
 }
 
 // server/lib/llmEvalHarness.ts
-var log16 = logger.child({ module: "llm-eval-harness" });
+var log19 = logger.child({ module: "llm-eval-harness" });
 var __dirname3 = dirname3(fileURLToPath3(import.meta.url));
 var GROUND_TRUTH_CANDIDATES = [
-  resolve3(__dirname3, "../../.planning/eval/ground-truth-events.json"),
+  resolve3(__dirname3, "../data/eval/ground-truth-events.json"),
   // dev (tsx src)
   resolve3(__dirname3, "_eval/ground-truth-events.json")
   // prod (api/_eval/ bundled)
@@ -4886,7 +5656,7 @@ function loadGroundTruth() {
   const groundTruthPath = resolveGroundTruthPath();
   try {
     if (!existsSync4(groundTruthPath)) {
-      log16.info(
+      log19.info(
         { path: groundTruthPath },
         "ground-truth file absent; eval harness will report zeros"
       );
@@ -4898,23 +5668,23 @@ function loadGroundTruth() {
     try {
       parsed = JSON.parse(raw);
     } catch (parseErr) {
-      log16.warn({ err: parseErr, path: groundTruthPath }, "ground-truth JSON parse failed");
+      log19.warn({ err: parseErr, path: groundTruthPath }, "ground-truth JSON parse failed");
       cachedGroundTruth = null;
       return null;
     }
     if (!isValidGroundTruth(parsed)) {
-      log16.warn({ path: groundTruthPath }, "ground-truth failed structural validation");
+      log19.warn({ path: groundTruthPath }, "ground-truth failed structural validation");
       cachedGroundTruth = null;
       return null;
     }
     cachedGroundTruth = parsed;
-    log16.info(
+    log19.info(
       { count: parsed.events.length, curatedAt: parsed.curatedAt },
       "loaded ground-truth event set"
     );
     return parsed;
   } catch (err) {
-    log16.warn({ err, path: groundTruthPath }, "failed to load ground-truth file");
+    log19.warn({ err, path: groundTruthPath }, "failed to load ground-truth file");
     cachedGroundTruth = null;
     return null;
   }
@@ -4962,7 +5732,7 @@ async function runEval(opts = {}) {
       if (dKm <= 20) w20++;
       if (dKm <= 100) w100++;
     } catch (err) {
-      log16.warn({ err, id: ev.id }, "eval harness resolve failed for event");
+      log19.warn({ err, id: ev.id }, "eval harness resolve failed for event");
     }
   }
   let actorMatched = 0;
@@ -4996,7 +5766,7 @@ async function runEval(opts = {}) {
       }
     }
   } catch (err) {
-    log16.warn({ err }, "D-13 actorMatchRate computation failed; falling back to 0");
+    log19.warn({ err }, "D-13 actorMatchRate computation failed; falling back to 0");
   }
   const actorMatchRate = actorTotal === 0 ? null : actorMatched / actorTotal;
   const score = {
@@ -5011,12 +5781,12 @@ async function runEval(opts = {}) {
   try {
     await cacheSetSafe(key, score, BASELINE_TTL_SEC);
   } catch (err) {
-    log16.warn({ err, key }, "failed to persist eval baseline to Redis");
+    log19.warn({ err, key }, "failed to persist eval baseline to Redis");
   }
   return score;
 }
 var ADVERSARIAL_FIXTURE_CANDIDATES = [
-  resolve3(__dirname3, "../../.planning/eval/adversarial-injections.json"),
+  resolve3(__dirname3, "../data/eval/adversarial-injections.json"),
   // dev
   resolve3(__dirname3, "_eval/adversarial-injections.json")
   // prod bundled
@@ -5033,21 +5803,21 @@ function loadAdversarialFixture() {
   const fixturePath = resolveAdversarialFixturePath();
   try {
     if (!existsSync4(fixturePath)) {
-      log16.info({ path: fixturePath }, "adversarial fixture absent; sub-eval will report skipped");
+      log19.info({ path: fixturePath }, "adversarial fixture absent; sub-eval will report skipped");
       cachedAdversarialFixture = null;
       return null;
     }
     const raw = readFileSync4(fixturePath, "utf-8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.entries)) {
-      log16.warn({ path: fixturePath }, "adversarial fixture failed structural validation");
+      log19.warn({ path: fixturePath }, "adversarial fixture failed structural validation");
       cachedAdversarialFixture = null;
       return null;
     }
     cachedAdversarialFixture = parsed;
     return cachedAdversarialFixture;
   } catch (err) {
-    log16.warn({ err, path: fixturePath }, "failed to load adversarial fixture");
+    log19.warn({ err, path: fixturePath }, "failed to load adversarial fixture");
     cachedAdversarialFixture = null;
     return null;
   }
@@ -5057,7 +5827,7 @@ async function runAdversarialEval() {
   try {
     const used = await getDailyTokens("nvidia_nim");
     if (budgetState("nvidia_nim", used) === "hard") {
-      log16.warn("adversarial sub-eval skipped \u2014 NVIDIA NIM token budget at hard cap");
+      log19.warn("adversarial sub-eval skipped \u2014 NVIDIA NIM token budget at hard cap");
       return {
         total: 0,
         blocked: 0,
@@ -5069,7 +5839,7 @@ async function runAdversarialEval() {
       };
     }
   } catch (err) {
-    log16.warn({ err }, "adversarial sub-eval token-budget probe failed (continuing)");
+    log19.warn({ err }, "adversarial sub-eval token-budget probe failed (continuing)");
   }
   const fixture = loadAdversarialFixture();
   if (!fixture) {
@@ -5104,7 +5874,7 @@ async function runAdversarialEval() {
         byCategory[cat].blocked += 1;
       } else {
         leaked += 1;
-        log16.warn(
+        log19.warn(
           {
             entryId: entry.id,
             category: cat,
@@ -5117,7 +5887,7 @@ async function runAdversarialEval() {
     } catch (err) {
       blocked += 1;
       byCategory[cat].blocked += 1;
-      log16.info(
+      log19.info(
         { entryId: entry.id, category: cat, err: err instanceof Error ? err.message : err },
         "adversarial entry blocked by resolver throw"
       );
@@ -5135,13 +5905,44 @@ async function runAdversarialEval() {
   try {
     await cacheSetSafe(ADVERSARIAL_KEY, result, ADVERSARIAL_TTL_SEC);
   } catch (err) {
-    log16.warn({ err, key: ADVERSARIAL_KEY }, "failed to persist adversarial eval to Redis");
+    log19.warn({ err, key: ADVERSARIAL_KEY }, "failed to persist adversarial eval to Redis");
   }
   return result;
 }
 
+// server/lib/trendHistory.ts
+init_redis();
+var log20 = logger.child({ module: "trend-history" });
+var TREND_HISTORY_KEY = "dashboard:trends:history";
+var TREND_MAX = 30;
+var TREND_TTL_SEC = 30 * 24 * 3600;
+function parseEntry4(raw) {
+  try {
+    if (typeof raw === "string") return JSON.parse(raw);
+    if (raw && typeof raw === "object") return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+async function appendTrendSample(sample) {
+  try {
+    await redis.pipeline().lpush(TREND_HISTORY_KEY, JSON.stringify(sample)).ltrim(TREND_HISTORY_KEY, 0, TREND_MAX - 1).expire(TREND_HISTORY_KEY, TREND_TTL_SEC).exec();
+  } catch (err) {
+    log20.warn({ err }, "trendHistory append failed");
+  }
+}
+async function readTrendHistory(limit = TREND_MAX) {
+  try {
+    const raw = await redis.lrange(TREND_HISTORY_KEY, 0, limit - 1);
+    return raw.map((r) => parseEntry4(r)).filter((x) => x !== null);
+  } catch {
+    return [];
+  }
+}
+
 // server/routes/cron-health.ts
-var log17 = logger.child({ module: "cron-health" });
+var log21 = logger.child({ module: "cron-health" });
 var cronHealthRouter = Router2();
 var STALE_THRESHOLD_MS = 60 * 60 * 1e3;
 cronHealthRouter.get("/", async (req, res) => {
@@ -5161,7 +5962,7 @@ cronHealthRouter.get("/", async (req, res) => {
     await redis.ping();
     redisOk = true;
   } catch {
-    log17.error("Redis ping failed");
+    log21.error("Redis ping failed");
   }
   const sources = {};
   const warnings = [];
@@ -5185,29 +5986,82 @@ cronHealthRouter.get("/", async (req, res) => {
     })
   );
   if (warnings.length > 0) {
-    log17.warn({ warningCount: warnings.length, warnings }, "source health warnings");
+    log21.warn({ warningCount: warnings.length, warnings }, "source health warnings");
   } else {
-    log17.info("all sources healthy");
+    log21.info("all sources healthy");
   }
   let evalScore = null;
   let evalError = null;
   try {
     evalScore = await runEval();
-    log17.info({ evalScore }, "eval drift check complete");
+    log21.info({ evalScore }, "eval drift check complete");
   } catch (err) {
     evalError = err instanceof Error ? err.message : String(err);
-    log17.warn({ err: evalError }, "eval drift check threw \u2014 continuing health response");
+    log21.warn({ err: evalError }, "eval drift check threw \u2014 continuing health response");
   }
   let adversarialResult = null;
   let adversarialError = null;
   try {
     adversarialResult = await runAdversarialEval();
-    log17.info({ adversarialResult }, "adversarial sub-eval complete");
+    log21.info({ adversarialResult }, "adversarial sub-eval complete");
   } catch (err) {
     adversarialError = err instanceof Error ? err.message : String(err);
-    log17.warn({ err: adversarialError }, "adversarial sub-eval threw \u2014 continuing health response");
+    log21.warn({ err: adversarialError }, "adversarial sub-eval threw \u2014 continuing health response");
   }
   await cacheSetSafe("cron:lastTick:health", Date.now(), CRON_LASTTICK_TTL_SEC);
+  let watchCronAgeMs = null;
+  const sampleNow = Date.now();
+  try {
+    const cronNames = ["health", "warm", "refresh-events"];
+    const ages = await Promise.all(
+      cronNames.map(async (name) => {
+        const entry = await cacheGetSafe(`cron:lastTick:${name}`, 999999999);
+        if (entry === null) return null;
+        const tickTs = typeof entry.data === "number" ? entry.data : entry.lastFresh;
+        return Math.max(0, sampleNow - tickTs);
+      })
+    );
+    let deadUrlCount = 0;
+    try {
+      const raw = await redis.get(URL_LIVENESS_COUNT_KEY);
+      deadUrlCount = Math.max(0, Number(raw) || 0);
+    } catch (err) {
+      log21.warn({ err }, "failed to read events:url-liveness-count for trend sample");
+    }
+    watchCronAgeMs = {
+      // `?? null` collapses the `| undefined` that noUncheckedIndexedAccess
+      // adds to these in-bounds tuple reads back to the degrade-open `null`
+      // the TrendSample contract expects (absent → null, never fabricate).
+      health: ages[0] ?? null,
+      warm: ages[1] ?? null,
+      "refresh-events": ages[2] ?? null
+    };
+    await appendTrendSample({
+      sampledAt: new Date(sampleNow).toISOString(),
+      cronAgeMs: watchCronAgeMs,
+      deadUrlCount
+    });
+  } catch (err) {
+    log21.warn({ err }, "trend sample append threw \u2014 continuing health response");
+  }
+  try {
+    const evalHealthy = redisOk && evalScore !== null && evalError === null;
+    await appendWatchSample({
+      sampledAt: new Date(sampleNow).toISOString(),
+      tickDate: new Date(sampleNow).toISOString().slice(0, 10),
+      cronAgeMs: watchCronAgeMs ?? { health: null, warm: null, "refresh-events": null },
+      eval: {
+        at5km: evalScore?.within5km ?? 0,
+        at20km: evalScore?.within20km ?? 0,
+        at100km: evalScore?.within100km ?? 0
+      },
+      dlqCount: 0,
+      breakerTrips: 0,
+      result: evalHealthy ? "PASS" : "FAIL"
+    });
+  } catch (err) {
+    log21.warn({ err }, "watch sample append threw \u2014 continuing health response");
+  }
   res.json({
     status: redisOk ? "ok" : "degraded",
     redis: redisOk,
@@ -82223,7 +83077,7 @@ var RateLimitError = class extends Error {
 };
 
 // server/adapters/overpass-water.ts
-var log18 = logger.child({ module: "overpass-water" });
+var log22 = logger.child({ module: "overpass-water" });
 var OVERPASS_URL = "https://overpass-api.de/api/interpreter";
 var OVERPASS_FALLBACK = "https://overpass.private.coffee/api/interpreter";
 var TIMEOUT_MS = 9e4;
@@ -82330,6 +83184,28 @@ function applyRomanizedName(tags, facilityType) {
   };
 }
 var EXCLUDED_COUNTRIES = /* @__PURE__ */ new Set(["Uzbekistan", "Tajikistan", "Kyrgyzstan", "Kazakhstan"]);
+function normName(f) {
+  return (f.label ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+function spatialDedup(facilities) {
+  const ordered = [...facilities].sort(
+    (a, b) => (b.notabilityScore ?? 0) - (a.notabilityScore ?? 0) || a.osmId - b.osmId
+  );
+  const kept = [];
+  let collapsed = 0;
+  for (const f of ordered) {
+    const fname = normName(f);
+    const isDupe = kept.some((existing) => {
+      if (existing.facilityType !== f.facilityType) return false;
+      if (haversine(existing.lat, existing.lng, f.lat, f.lng) >= 0.05) return false;
+      const ename = normName(existing);
+      return ename === fname || ename === "" || fname === "";
+    });
+    if (!isDupe) kept.push(f);
+    else collapsed++;
+  }
+  return { kept, collapsed };
+}
 function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const toRad = (d) => d * Math.PI / 180;
@@ -82631,7 +83507,7 @@ async function fetchFacilityType(entry, stats) {
       });
       statusCode = res.status;
       if (!res.ok) {
-        log18.warn(
+        log22.warn(
           { facilityType: entry.label, url, status: res.status },
           "Overpass returned error status"
         );
@@ -82661,13 +83537,13 @@ async function fetchFacilityType(entry, stats) {
         attempts,
         ok: true
       });
-      log18.info(
+      log22.info(
         { facilityType: entry.label, raw: json.elements.length, kept: facilities.length },
         "fetched facilities"
       );
       return facilities;
     } catch (err) {
-      log18.warn({ err, facilityType: entry.label, url }, "Overpass request failed");
+      log22.warn({ err, facilityType: entry.label, url }, "Overpass request failed");
       stats.overpass.push({
         facilityType: entry.label,
         mirror: mirrorLabel,
@@ -82678,7 +83554,7 @@ async function fetchFacilityType(entry, stats) {
       });
     }
   }
-  log18.warn({ facilityType: entry.label }, "all URLs failed, skipping");
+  log22.warn({ facilityType: entry.label }, "all URLs failed, skipping");
   return [];
 }
 async function fetchWaterFacilities() {
@@ -82722,7 +83598,7 @@ async function fetchWaterFacilities() {
         all.push(...facilities);
       }
     } catch (err) {
-      log18.warn({ facilityType: entry.label, err }, "query failed, continuing");
+      log22.warn({ facilityType: entry.label, err }, "query failed, continuing");
     }
   }
   if (succeeded === 0) {
@@ -82730,14 +83606,8 @@ async function fetchWaterFacilities() {
   }
   const unique = /* @__PURE__ */ new Map();
   for (const f of all) unique.set(f.id, f);
-  const deduped = [];
-  for (const f of Array.from(unique.values())) {
-    const isDupe = deduped.some(
-      (existing) => existing.facilityType === f.facilityType && haversine(existing.lat, existing.lng, f.lat, f.lng) < 0.05
-    );
-    if (!isDupe) deduped.push(f);
-    else stats.rejections.duplicate++;
-  }
+  const { kept: deduped, collapsed } = spatialDedup(Array.from(unique.values()));
+  stats.rejections.duplicate += collapsed;
   for (const f of deduped) {
     if (f.capacity) stats.enrichment.withCapacity++;
     if (f.nearestCity) stats.enrichment.withCity++;
@@ -82759,7 +83629,7 @@ async function fetchWaterFacilities() {
     count: deduped.filter((f) => (f.notabilityScore ?? 0) >= lo && (f.notabilityScore ?? 0) < hi).length
   }));
   stats.generatedAt = (/* @__PURE__ */ new Date()).toISOString();
-  log18.info(
+  log22.info(
     { total: deduped.length, succeeded, totalQueries: FACILITY_QUERIES.length, stats },
     "water facilities fetch complete"
   );
@@ -82767,7 +83637,7 @@ async function fetchWaterFacilities() {
 }
 
 // server/adapters/overpass.ts
-var log19 = logger.child({ module: "overpass" });
+var log23 = logger.child({ module: "overpass" });
 var OVERPASS_URL2 = "https://overpass-api.de/api/interpreter";
 var OVERPASS_FALLBACK2 = "https://overpass.private.coffee/api/interpreter";
 var TIMEOUT_MS2 = 6e4;
@@ -82905,7 +83775,7 @@ async function fetchSites() {
       });
       statusCode = res.status;
       if (!res.ok) {
-        log19.warn({ url, status: res.status }, "Overpass returned error status");
+        log23.warn({ url, status: res.status }, "Overpass returned error status");
         stats.overpass.push({
           facilityType: "sites",
           mirror: mirrorLabel,
@@ -82974,7 +83844,7 @@ async function fetchSites() {
       stats.generatedAt = (/* @__PURE__ */ new Date()).toISOString();
       return { sites: kept, stats };
     } catch (err) {
-      log19.warn({ err, url }, "Overpass request failed");
+      log23.warn({ err, url }, "Overpass request failed");
       stats.overpass.push({
         facilityType: "sites",
         mirror: mirrorLabel,
@@ -82990,14 +83860,14 @@ async function fetchSites() {
 
 // server/routes/cron-warm.ts
 init_redis();
-var log20 = logger.child({ module: "cron-warm" });
+var log24 = logger.child({ module: "cron-warm" });
 var SITES_REDIS_TTL_SEC = 259200;
 var SITES_KEY = "sites:v3";
-var WATER_KEY = "water:facilities:v3";
+var WATER_KEY = "water:facilities:v4";
 var cronWarmRouter = Router3();
 cronWarmRouter.get("/", async (_req, res) => {
   const start = Date.now();
-  log20.info("starting cache pre-warm");
+  log24.info("starting cache pre-warm");
   const results = await Promise.allSettled([
     (async () => {
       const { sites, stats } = await fetchSites();
@@ -83017,7 +83887,7 @@ cronWarmRouter.get("/", async (_req, res) => {
   };
   const allOk = results.every((r) => r.status === "fulfilled");
   const logLevel = allOk ? "info" : "warn";
-  log20[logLevel](summary, "cache pre-warm complete");
+  log24[logLevel](summary, "cache pre-warm complete");
   const partialOrBetter = results.some((r) => r.status === "fulfilled");
   if (partialOrBetter) {
     await cacheSetSafe("cron:lastTick:warm", Date.now(), CRON_LASTTICK_TTL_SEC);
@@ -83069,7 +83939,7 @@ dashboardAuthRouter.get("/auth-check", dashboardAuth, (_req, res) => {
 
 // server/routes/eval-cron.ts
 import { Router as Router5 } from "express";
-var log21 = logger.child({ module: "eval-cron" });
+var log25 = logger.child({ module: "eval-cron" });
 var evalCronRouter = Router5();
 evalCronRouter.post("/", async (req, res) => {
   if (env.CRON_SECRET) {
@@ -83085,7 +83955,7 @@ evalCronRouter.post("/", async (req, res) => {
     const score = await runEval();
     const durationMs = Date.now() - t0;
     const ratioWithin20km = score.total > 0 ? score.within20km / score.total : 0;
-    log21.info({ score, durationMs, ratioWithin20km }, "eval cron run complete");
+    log25.info({ score, durationMs, ratioWithin20km }, "eval cron run complete");
     res.status(200).json({
       status: "ok",
       score,
@@ -83095,7 +83965,7 @@ evalCronRouter.post("/", async (req, res) => {
   } catch (err) {
     const durationMs = Date.now() - t0;
     const message = err instanceof Error ? err.message : String(err);
-    log21.error({ err: message, durationMs }, "eval cron run failed");
+    log25.error({ err: message, durationMs }, "eval cron run failed");
     res.status(500).json({ status: "error", error: message, durationMs });
   }
 });
@@ -83103,398 +83973,6 @@ evalCronRouter.post("/", async (req, res) => {
 // server/routes/events.ts
 import { Router as Router6 } from "express";
 import { z as z6 } from "zod";
-
-// server/adapters/gdelt.ts
-import AdmZip from "adm-zip";
-var log22 = logger.child({ module: "gdelt" });
-var GDELT_LASTUPDATE_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
-var MIDDLE_EAST_FIPS = /* @__PURE__ */ new Set([
-  "IR",
-  // Iran
-  "IZ",
-  // Iraq (FIPS, not ISO "IQ")
-  "SY",
-  // Syria
-  "TU",
-  // Turkey (FIPS, not ISO "TR")
-  "SA",
-  // Saudi Arabia
-  "YM",
-  // Yemen
-  "MU",
-  // Oman
-  "AE",
-  // United Arab Emirates
-  "QA",
-  // Qatar
-  "BA",
-  // Bahrain
-  "KU",
-  // Kuwait
-  "JO",
-  // Jordan
-  "IS",
-  // Israel (FIPS, not ISO "IL")
-  "LE",
-  // Lebanon
-  "AF",
-  // Afghanistan
-  "PK"
-  // Pakistan
-]);
-var CONFLICT_ROOT_CODES = /* @__PURE__ */ new Set(["18", "19", "20"]);
-var COL = {
-  GLOBALEVENTID: 0,
-  SQLDATE: 1,
-  Actor1Name: 6,
-  Actor1CountryCode: 7,
-  Actor2Name: 16,
-  Actor2CountryCode: 17,
-  EventCode: 26,
-  EventBaseCode: 27,
-  EventRootCode: 28,
-  GoldsteinScale: 30,
-  NumMentions: 31,
-  NumSources: 32,
-  ActionGeo_Type: 51,
-  ActionGeo_FullName: 52,
-  ActionGeo_CountryCode: 53,
-  ActionGeo_ADM1Code: 54,
-  ActionGeo_ADM2Code: 55,
-  ActionGeo_Lat: 56,
-  ActionGeo_Long: 57,
-  ActionGeo_FeatureID: 58,
-  SOURCEURL: 60
-};
-async function getExportUrl() {
-  const res = await fetch(GDELT_LASTUPDATE_URL);
-  if (!res.ok) {
-    throw new Error(`GDELT lastupdate.txt failed: ${res.status}`);
-  }
-  const text = await res.text();
-  const lines = text.trim().split("\n");
-  const exportLine = lines.find((l) => l.includes(".export.CSV.zip"));
-  if (!exportLine) {
-    throw new Error("No export URL found in lastupdate.txt");
-  }
-  const parts = exportLine.trim().split(" ");
-  const url = parts[2];
-  if (!url) {
-    throw new Error("Malformed lastupdate.txt: missing URL column");
-  }
-  return url;
-}
-async function downloadAndUnzip(url) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`GDELT export download failed: ${res.status}`);
-  }
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const zip = new AdmZip(buffer);
-  const entries = zip.getEntries();
-  const firstEntry = entries[0];
-  if (!firstEntry) {
-    throw new Error("GDELT ZIP archive contained no entries");
-  }
-  return firstEntry.getData().toString("utf8");
-}
-function getCol(cols, idx) {
-  return cols[idx] ?? "";
-}
-var BASE_CODE_MAP = {
-  "181": "targeted",
-  // Abduction / hostage-taking
-  "182": "on_ground",
-  // Physical assault
-  "183": "explosion",
-  // Bombing
-  "184": "on_ground",
-  // Use as human shield
-  "185": "targeted",
-  // Assassination attempt
-  "186": "targeted",
-  // Assassination
-  "190": "on_ground",
-  // Conventional military force
-  "191": "other",
-  // Blockade
-  "193": "on_ground",
-  // Small arms / light weapons
-  "194": "explosion",
-  // Artillery / tank support (shelling)
-  "195": "airstrike",
-  // Aerial weapons
-  "196": "other",
-  // Ceasefire violation
-  "200": "other",
-  // Unconventional mass violence
-  "201": "other",
-  // Mass expulsion
-  "202": "other",
-  // Mass killings
-  "203": "other",
-  // Ethnic cleansing
-  "204": "other"
-  // WMD
-};
-var ROOT_FALLBACK = {
-  "18": "on_ground",
-  "19": "on_ground",
-  "20": "other"
-};
-function classifyByBaseCode(eventBaseCode, eventRootCode) {
-  return BASE_CODE_MAP[eventBaseCode] ?? ROOT_FALLBACK[eventRootCode] ?? "on_ground";
-}
-function parseSqlDate(sqlDate) {
-  const year = parseInt(sqlDate.slice(0, 4), 10);
-  const month = parseInt(sqlDate.slice(4, 6), 10) - 1;
-  const day = parseInt(sqlDate.slice(6, 8), 10);
-  return Date.UTC(year, month, day);
-}
-var BASE_CODE_DESCRIPTIONS = {
-  "180": "Unconventional violence",
-  "181": "Abduction / hostage-taking",
-  "182": "Physical assault",
-  "183": "Bombing",
-  "184": "Use as human shield",
-  "185": "Assassination attempt",
-  "186": "Assassination",
-  "190": "Conventional military force",
-  "191": "Blockade / movement restriction",
-  "193": "Small arms / light weapons",
-  "194": "Artillery / tank support",
-  "195": "Aerial weapons",
-  "196": "Ceasefire violation",
-  "200": "Unconventional mass violence",
-  "201": "Mass expulsion",
-  "202": "Mass killings",
-  "203": "Ethnic cleansing",
-  "204": "Weapons of mass destruction"
-};
-function describeEvent(eventBaseCode) {
-  return BASE_CODE_DESCRIPTIONS[eventBaseCode] ?? "Unknown conflict";
-}
-function actionGeoTypeToPrecision(geoType) {
-  switch (geoType) {
-    case 4:
-      return "exact";
-    // landmark — most precise GDELT geocoding
-    case 3:
-      return "city";
-    // city-level — ~5km uncertainty
-    case 2:
-      return "region";
-    // ADM1/state — ~25km uncertainty
-    case 1:
-      return "region";
-    // country-level — ~25km uncertainty
-    default:
-      return void 0;
-  }
-}
-function normalizeGdeltEvent(cols, lat, lng) {
-  const eventBaseCode = getCol(cols, COL.EventBaseCode);
-  const eventRootCode = getCol(cols, COL.EventRootCode);
-  const eventCode = getCol(cols, COL.EventCode);
-  const sqlDate = getCol(cols, COL.SQLDATE);
-  const actionGeoType = parseInt(getCol(cols, COL.ActionGeo_Type), 10) || void 0;
-  const precision = actionGeoTypeToPrecision(actionGeoType);
-  return {
-    id: `gdelt-${getCol(cols, COL.GLOBALEVENTID)}`,
-    type: classifyByBaseCode(eventBaseCode, eventRootCode),
-    lat,
-    lng,
-    timestamp: parseSqlDate(sqlDate),
-    label: `${getCol(cols, COL.ActionGeo_FullName)}: ${describeEvent(eventBaseCode)}`,
-    data: {
-      eventType: describeEvent(eventBaseCode),
-      subEventType: `CAMEO ${eventCode}`,
-      fatalities: 0,
-      // GDELT does not track fatalities
-      actor1: getCol(cols, COL.Actor1Name),
-      actor2: getCol(cols, COL.Actor2Name),
-      notes: "",
-      source: getCol(cols, COL.SOURCEURL),
-      goldsteinScale: parseFloat(getCol(cols, COL.GoldsteinScale)) || 0,
-      locationName: getCol(cols, COL.ActionGeo_FullName),
-      cameoCode: eventCode,
-      numMentions: parseInt(getCol(cols, COL.NumMentions), 10) || void 0,
-      numSources: parseInt(getCol(cols, COL.NumSources), 10) || void 0,
-      actionGeoType,
-      precision
-    }
-  };
-}
-function parseAndFilter(csv, bellingcatArticles) {
-  const lines = csv.trim().split("\n");
-  const rawCount = lines.length;
-  const config2 = getConfig();
-  const excludedCameo = new Set(config2.eventExcludedCameo);
-  const best = /* @__PURE__ */ new Map();
-  let geoDiscardCount = 0;
-  for (const line of lines) {
-    const cols = line.split("	");
-    if (cols.length < 61) continue;
-    const eventRootCode = getCol(cols, COL.EventRootCode);
-    const countryCode = getCol(cols, COL.ActionGeo_CountryCode);
-    if (!CONFLICT_ROOT_CODES.has(eventRootCode)) continue;
-    const eventBaseCode = getCol(cols, COL.EventBaseCode);
-    if (excludedCameo.has(eventBaseCode)) continue;
-    if (!MIDDLE_EAST_FIPS.has(countryCode)) continue;
-    const fullName = getCol(cols, COL.ActionGeo_FullName);
-    if (!isGeoValid(fullName, countryCode)) {
-      geoDiscardCount++;
-      log22.warn(
-        { eventId: getCol(cols, COL.GLOBALEVENTID), fullName, countryCode },
-        "discarded: FullName contradicts FIPS"
-      );
-      continue;
-    }
-    const numSources = parseInt(getCol(cols, COL.NumSources), 10) || 0;
-    if (numSources < config2.eventMinSources) continue;
-    const actor1Country = getCol(cols, COL.Actor1CountryCode).trim();
-    const actor2Country = getCol(cols, COL.Actor2CountryCode).trim();
-    if (!actor1Country && !actor2Country) continue;
-    const lat = parseFloat(getCol(cols, COL.ActionGeo_Lat));
-    const lng = parseFloat(getCol(cols, COL.ActionGeo_Long));
-    if (isNaN(lat) || isNaN(lng)) continue;
-    const key = `${getCol(cols, COL.SQLDATE)}|${getCol(cols, COL.EventCode)}|${lat}|${lng}`;
-    const mentions = parseInt(getCol(cols, COL.NumMentions), 10) || 0;
-    const existing = best.get(key);
-    if (!existing || mentions > existing.mentions) {
-      best.set(key, { cols, lat, lng, mentions });
-    }
-  }
-  const geoValidCount = best.size;
-  const { eventConfidenceThreshold, eventCentroidPenalty } = config2;
-  let reclassifyCount = 0;
-  let thresholdDiscardCount = 0;
-  const results = [];
-  for (const entry of best.values()) {
-    let entity = normalizeGdeltEvent(entry.cols, entry.lat, entry.lng);
-    const origType = entity.type;
-    entity = applyGoldsteinSanity(entity);
-    if (entity.type !== origType) {
-      reclassifyCount++;
-      const ceiling = GOLDSTEIN_CEILINGS[origType]?.ceiling;
-      log22.info(
-        {
-          id: entity.id,
-          from: origType,
-          to: entity.type,
-          goldstein: entity.data.goldsteinScale,
-          ceiling
-        },
-        "reclassified event"
-      );
-    }
-    const geoPrecision = detectCentroid(entity.lat, entity.lng);
-    entity = { ...entity, data: { ...entity.data, geoPrecision } };
-    let confidence = computeEventConfidence(entity, geoPrecision);
-    const actionGeoType = entity.data.actionGeoType;
-    if (actionGeoType === 3 || actionGeoType === 4) {
-      confidence *= eventCentroidPenalty;
-    }
-    entity = { ...entity, data: { ...entity.data, confidence } };
-    if (confidence < eventConfidenceThreshold) {
-      thresholdDiscardCount++;
-      log22.warn(
-        { id: entity.id, confidence: +confidence.toFixed(3), threshold: eventConfidenceThreshold },
-        "discarded: below confidence threshold"
-      );
-      continue;
-    }
-    if (bellingcatArticles && bellingcatArticles.length > 0) {
-      const corroboration = checkBellingcatCorroboration(entity, bellingcatArticles);
-      if (corroboration.matched) {
-        confidence = Math.min(1, confidence + config2.bellingcatCorroborationBoost);
-        entity = { ...entity, data: { ...entity.data, confidence } };
-        log22.info(
-          {
-            id: entity.id,
-            boost: config2.bellingcatCorroborationBoost,
-            confidence: +confidence.toFixed(3),
-            article: corroboration.article.url
-          },
-          "Bellingcat corroboration boost"
-        );
-      }
-    }
-    results.push(entity);
-  }
-  log22.info(
-    {
-      rawCount,
-      geoValidCount,
-      geoDiscardCount,
-      reclassifyCount,
-      aboveThreshold: geoValidCount - thresholdDiscardCount,
-      finalCount: results.length
-    },
-    "pipeline summary"
-  );
-  return results;
-}
-async function fetchEvents(bellingcatArticles) {
-  const start = Date.now();
-  const exportUrl = await getExportUrl();
-  const csv = await downloadAndUnzip(exportUrl);
-  const events = parseAndFilter(csv, bellingcatArticles);
-  log22.info({ count: events.length, durationMs: Date.now() - start }, "fetched events");
-  return events;
-}
-function generateBackfillUrls(fromTs, toTs, intervalMs) {
-  const urls = [];
-  const interval = intervalMs ?? 6 * 60 * 60 * 1e3;
-  const start = new Date(fromTs);
-  start.setUTCHours(0, 0, 0, 0);
-  let cursor = start.getTime();
-  while (cursor <= toTs) {
-    const d = new Date(cursor);
-    const yyyy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const dd = String(d.getUTCDate()).padStart(2, "0");
-    const hh = String(d.getUTCHours()).padStart(2, "0");
-    urls.push(`http://data.gdeltproject.org/gdeltv2/${yyyy}${mm}${dd}${hh}0000.export.CSV.zip`);
-    cursor += interval;
-  }
-  return urls;
-}
-async function backfillEvents(days) {
-  const toTs = Date.now();
-  const fromTs = toTs - days * 24 * 60 * 60 * 1e3;
-  const start = Date.now();
-  const urls = generateBackfillUrls(fromTs, toTs);
-  log22.info({ fileCount: urls.length, days, sampling: "4/day" }, "backfill started");
-  const merged = /* @__PURE__ */ new Map();
-  const BATCH_SIZE3 = 5;
-  for (let i = 0; i < urls.length; i += BATCH_SIZE3) {
-    const batch = urls.slice(i, i + BATCH_SIZE3);
-    const results = await Promise.allSettled(
-      batch.map(async (url) => {
-        const csv = await downloadAndUnzip(url);
-        return parseAndFilter(csv);
-      })
-    );
-    for (const result of results) {
-      if (result.status === "fulfilled") {
-        for (const e of result.value) {
-          if (!merged.has(e.id)) {
-            merged.set(e.id, e);
-          }
-        }
-      }
-    }
-  }
-  const events = Array.from(merged.values());
-  log22.info(
-    { count: events.length, fileCount: urls.length, durationMs: Date.now() - start },
-    "backfill complete"
-  );
-  return events;
-}
-
-// server/routes/events.ts
 init_redis();
 
 // server/lib/normalizeEventTypes.ts
@@ -83603,7 +84081,7 @@ function validateQuery(schema) {
 }
 
 // server/middleware/validateResponse.ts
-var log23 = logger.child({ module: "validateResponse" });
+var log26 = logger.child({ module: "validateResponse" });
 function sendValidated(res, schema, payload) {
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
@@ -83616,7 +84094,7 @@ function sendValidated(res, schema, payload) {
         `Response validation failed at ${path}: ${JSON.stringify(issues)}`
       );
     }
-    log23.warn({ issues, path }, "response schema mismatch \u2014 sending unvalidated payload");
+    log26.warn({ issues, path }, "response schema mismatch \u2014 sending unvalidated payload");
     res.json(payload);
     return;
   }
@@ -83776,15 +84254,11 @@ var sitesResponseSchema = cacheResponseSchema(z5.array(siteEntitySchema)).extend
 });
 
 // server/routes/events.ts
-var log24 = logger.child({ module: "events" });
+var log27 = logger.child({ module: "events" });
 var eventsQuerySchema = z6.object({
   backfill: z6.enum(["true", "false"]).optional().transform((v) => v === "true")
 });
-var EVENTS_KEY2 = "events:gdelt";
 var LOGICAL_TTL_MS = CACHE_TTL.events;
-var REDIS_TTL_SEC = 9e3;
-var BACKFILL_KEY = "events:backfill-ts";
-var BACKFILL_COOLDOWN_MS = 36e5;
 var LLM_EVENTS_KEY_ACTIVE2 = "events:llm:v3";
 var LLM_SUMMARY_KEY_ACTIVE_NAME = "events:llm-summary:v3";
 var LLM_PROCESS_KEY2 = "events:llm-process-ts";
@@ -83834,21 +84308,6 @@ async function loadRecentEnrichedEvents(limit) {
     });
   } catch {
     return [];
-  }
-}
-async function shouldBackfill() {
-  try {
-    const lastTs = await redis.get(BACKFILL_KEY);
-    if (lastTs === null || lastTs === void 0) return true;
-    return Date.now() - lastTs > BACKFILL_COOLDOWN_MS;
-  } catch {
-    return true;
-  }
-}
-async function recordBackfillTimestamp() {
-  try {
-    await redis.set(BACKFILL_KEY, Date.now(), { ex: REDIS_TTL_SEC });
-  } catch {
   }
 }
 async function recordLLMTimestamp() {
@@ -83970,7 +84429,7 @@ eventsRouter.get("/llm-history", dashboardAuth, async (req, res) => {
     const cached = await cacheGetSafe(LLM_EVENTS_KEY_ACTIVE2, 0);
     const existing = toEntityArray(cached?.data).find((e) => e.id.includes(groupKey));
     if (!existing) return res.status(404).json({ error: "not_found" });
-    const rawCache = await cacheGetSafe(EVENTS_KEY2, 0);
+    const rawCache = await cacheGetSafe(EVENTS_KEY, 0);
     if (!rawCache?.data) return res.status(404).json({ error: "gdelt_cache_empty" });
     const groups = groupGdeltRows(rawCache.data);
     const group = groups.find((g) => g.key === groupKey);
@@ -84053,68 +84512,23 @@ eventsRouter.get("/", validateQuery(eventsQuerySchema), async (_req, res) => {
       };
       await cacheSetSafe(LLM_SUMMARY_KEY_ACTIVE2, summary, LLM_SUMMARY_TTL_SEC2);
       await recordLLMTimestamp();
-      log24.info({ count: devData.length }, "served LLM events from dev file cache");
+      log27.info({ count: devData.length }, "served LLM events from dev file cache");
       return sendNormalizedEvents(res, { data: devData, stale: false, lastFresh: Date.now() });
     }
   }
-  const cached = forceBackfill ? null : await cacheGetSafe(EVENTS_KEY2, LOGICAL_TTL_MS);
-  if (cached && !cached.stale && !isLLMConfigured()) {
+  const cached = forceBackfill ? null : await cacheGetSafe(EVENTS_KEY, LOGICAL_TTL_MS);
+  if (cached && !cached.stale) {
+    if (llmCached?.data) {
+      return sendNormalizedEvents(res, {
+        data: llmCached.data,
+        stale: true,
+        lastFresh: llmCached.lastFresh
+      });
+    }
     return sendNormalizedEvents(res, cached);
   }
   try {
-    let bellingcatArticles = [];
-    try {
-      const newsCache = await cacheGetSafe("news:gdelt", 0);
-      if (newsCache?.data) {
-        bellingcatArticles = newsCache.data.flatMap((cluster) => cluster.articles).filter((a) => a.source === "Bellingcat").map((a) => ({
-          title: a.title,
-          url: a.url,
-          publishedAt: a.publishedAt,
-          ...extractBellingcatGeo(a.title)
-        }));
-      }
-    } catch {
-      log24.warn("failed to fetch Bellingcat articles for corroboration");
-    }
-    const fresh = await fetchEvents(bellingcatArticles);
-    const eventMap = /* @__PURE__ */ new Map();
-    if (cached) {
-      for (const event of cached.data) {
-        eventMap.set(event.id, event);
-      }
-    }
-    if ((!cached || forceBackfill) && (forceBackfill || await shouldBackfill())) {
-      try {
-        const backfillDays = Math.ceil((Date.now() - WAR_START) / 864e5);
-        const backfillData = await backfillEvents(backfillDays);
-        for (const event of backfillData) {
-          eventMap.set(event.id, event);
-        }
-        await recordBackfillTimestamp();
-        log24.info({ count: backfillData.length }, "backfill: merged historical events");
-      } catch (backfillErr) {
-        log24.warn({ err: backfillErr }, "backfill failed (non-fatal)");
-      }
-    }
-    for (const event of fresh) {
-      eventMap.set(event.id, event);
-    }
-    for (const [id, event] of eventMap) {
-      if (event.timestamp < WAR_START) {
-        eventMap.delete(id);
-      }
-    }
-    const merged = Array.from(eventMap.values());
-    for (const event of merged) {
-      if (event.data.sourceTier === void 0 && event.data.source) {
-        const domain = extractDomain(event.data.source);
-        const tier = domain ? getSourceTier("", domain) : null;
-        if (tier !== null) {
-          event.data.sourceTier = tier;
-        }
-      }
-    }
-    await cacheSetSafe(EVENTS_KEY2, merged, REDIS_TTL_SEC);
+    const merged = await refreshRawEvents({ cached, forceBackfill });
     if (llmCached?.data) {
       return sendNormalizedEvents(res, {
         data: llmCached.data,
@@ -84128,7 +84542,7 @@ eventsRouter.get("/", validateQuery(eventsQuerySchema), async (_req, res) => {
       lastFresh: Date.now()
     });
   } catch (err) {
-    log24.error({ err }, "upstream error");
+    log27.error({ err }, "upstream error");
     if (cached) {
       const pruned = cached.data.filter((e) => e.timestamp >= WAR_START);
       sendNormalizedEvents(res, {
@@ -84238,13 +84652,16 @@ function normalizeAircraft(ac) {
 }
 
 // server/adapters/adsb-lol.ts
-var log25 = logger.child({ module: "adsb-lol" });
+var log28 = logger.child({ module: "adsb-lol" });
 var BASE_URL = "https://api.adsb.lol";
 var FETCH_TIMEOUT = 1e4;
 async function fetchFlights() {
   const start = Date.now();
   const url = `${BASE_URL}/v2/lat/${IRAN_CENTER.lat}/lon/${IRAN_CENTER.lon}/dist/${ADSB_RADIUS_NM}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+  const res = await fetch(url, {
+    headers: { "User-Agent": OUTBOUND_USER_AGENT },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT)
+  });
   if (res.status === 429) {
     throw new RateLimitError("adsb.lol rate limit exceeded");
   }
@@ -84254,12 +84671,12 @@ async function fetchFlights() {
   const data = await res.json();
   const aircraft = data.ac ?? [];
   const flights = aircraft.map(normalizeAircraft).filter((f) => f !== null);
-  log25.info({ count: flights.length, durationMs: Date.now() - start }, "fetched flights");
+  log28.info({ count: flights.length, durationMs: Date.now() - start }, "fetched flights");
   return flights;
 }
 
 // server/adapters/opensky.ts
-var log26 = logger.child({ module: "opensky" });
+var log29 = logger.child({ module: "opensky" });
 var OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 var OPENSKY_API_URL = "https://opensky-network.org/api";
 var FETCH_TIMEOUT2 = 1e4;
@@ -84336,13 +84753,13 @@ async function fetchFlights2(bbox) {
   const data = await res.json();
   const states = data.states ?? [];
   const flights = states.map(normalizeFlightState).filter((f) => f !== null);
-  log26.info({ count: flights.length, durationMs: Date.now() - start }, "fetched flights");
+  log29.info({ count: flights.length, durationMs: Date.now() - start }, "fetched flights");
   return flights;
 }
 
 // server/routes/flights.ts
 init_redis();
-var log27 = logger.child({ module: "flights" });
+var log30 = logger.child({ module: "flights" });
 var flightsQuerySchema = z7.object({
   source: z7.enum(["opensky", "adsblol"]).default("adsblol")
 });
@@ -84388,7 +84805,7 @@ flightsRouter.get("/", validateQuery(flightsQuerySchema), async (_req, res) => {
       lastFresh: Date.now()
     });
   } catch (err) {
-    log27.error({ err, source }, "upstream error");
+    log30.error({ err, source }, "upstream error");
     if (err instanceof RateLimitError) {
       if (cached) {
         return sendValidated(res, flightsResponseSchema, { ...cached, rateLimited: true });
@@ -84437,6 +84854,7 @@ import { Router as Router9 } from "express";
 // server/lib/healthSchema.ts
 import { z as z9 } from "zod";
 var healthStatusEnum = z9.enum(["healthy", "degraded", "unhealthy", "unknown"]);
+var cronRunStateEnum = z9.enum(["unknown", "missed", "healthy"]);
 var healthTierEnum = z9.enum(["critical", "non-critical", "static", "probe-only", "cron"]);
 var endpointHealthSchema = z9.object({
   name: z9.string(),
@@ -84451,7 +84869,15 @@ var endpointHealthSchema = z9.object({
   /** D-25 freshness budget per endpoint. 0 for probe-only endpoints. */
   freshnessThresholdMs: z9.number().int().nonnegative(),
   /** Probe round-trip duration; null when the probe failed before measurement. */
-  latencyMs: z9.number().nullable()
+  latencyMs: z9.number().nullable(),
+  /**
+   * Phase 46 HARD-02 — cron run-state SIBLING field (D-05). Present ONLY on
+   * cron-tier rows; non-cron rows omit it. `.optional()` so old clients /
+   * non-cron rows still parse under `.strict()`. This is the missed-run
+   * signal — `status` stays in the 4-state `healthStatusEnum` and never
+   * carries `missed` (Pitfall 1 / okCron audit-gate safety).
+   */
+  missedRun: cronRunStateEnum.optional()
 }).strict();
 var tierRollupSchema = z9.object({
   healthy: z9.number().int().nonnegative(),
@@ -84479,7 +84905,7 @@ var healthResponseSchema = z9.object({
 }).strict();
 
 // server/routes/health.ts
-var log28 = logger.child({ module: "health" });
+var log31 = logger.child({ module: "health" });
 var healthRouter = Router9();
 var PROBE_TIMEOUT_MS2 = 2e3;
 var NEWS_RSS_ONLY_KEY = "news:feed:rss-only";
@@ -84771,11 +85197,11 @@ healthRouter.get("/", async (_req, res) => {
     const tier = TIER_BY_ENDPOINT[name];
     const threshold = FRESHNESS_THRESHOLDS_MS[name];
     if (tier === void 0 || threshold === void 0) {
-      log28.warn({ name }, "probe ran but tier or threshold not registered; skipping");
+      log31.warn({ name }, "probe ran but tier or threshold not registered; skipping");
       continue;
     }
     const status = deriveStatus(probe.freshnessMs, threshold, probe.hadError);
-    endpoints[name] = {
+    const row = {
       name,
       status,
       tier,
@@ -84785,6 +85211,20 @@ healthRouter.get("/", async (_req, res) => {
       freshnessThresholdMs: threshold,
       latencyMs: probe.latencyMs
     };
+    if (tier === "cron") {
+      const strategy = PROBE_STRATEGIES[name];
+      const cronName = strategy?.kind === "cron" ? strategy.cronName : void 0;
+      const grace = cronName ? CRON_SCHEDULE_GRACE_MS[cronName] : void 0;
+      if (grace !== void 0) {
+        row.missedRun = deriveCronRunState(
+          probe.freshnessMs,
+          grace.expectedIntervalMs,
+          grace.graceMs,
+          probe.lastSuccessTs !== null
+        );
+      }
+    }
+    endpoints[name] = row;
   }
   const response = {
     endpoints,
@@ -84795,7 +85235,7 @@ healthRouter.get("/", async (_req, res) => {
     try {
       healthResponseSchema.parse(response);
     } catch (err) {
-      log28.error({ err }, "/api/health response failed schema validation in dev");
+      log31.error({ err }, "/api/health response failed schema validation in dev");
     }
   }
   res.json(response);
@@ -84806,7 +85246,7 @@ import { Router as Router10 } from "express";
 import { z as z10 } from "zod";
 
 // server/adapters/yahoo-finance.ts
-var log29 = logger.child({ module: "yahoo-finance" });
+var log32 = logger.child({ module: "yahoo-finance" });
 var TICKERS = ["BZ=F", "CL=F", "XLE", "USO", "XOM"];
 var DISPLAY_NAMES = {
   "BZ=F": "Brent",
@@ -84830,19 +85270,19 @@ async function fetchTicker(symbol, range = "1d") {
       signal: AbortSignal.timeout(1e4)
     });
     if (!resp.ok) {
-      log29.warn({ symbol, status: resp.status }, "HTTP error");
+      log32.warn({ symbol, status: resp.status }, "HTTP error");
       return null;
     }
     const json = await resp.json();
     const result = json.chart?.result?.[0];
     if (!result) {
-      log29.warn({ symbol }, "no chart result");
+      log32.warn({ symbol }, "no chart result");
       return null;
     }
     const { meta, timestamp: rawTimestamps, indicators } = result;
     const quote = indicators?.quote?.[0];
     if (!meta || !rawTimestamps || !quote) {
-      log29.warn({ symbol }, "missing meta/timestamps/quote");
+      log32.warn({ symbol }, "missing meta/timestamps/quote");
       return null;
     }
     const price = meta.regularMarketPrice;
@@ -84879,7 +85319,7 @@ async function fetchTicker(symbol, range = "1d") {
       history: { timestamps, closes, highs, lows }
     };
   } catch (err) {
-    log29.warn({ err, symbol }, "fetch error");
+    log32.warn({ err, symbol }, "fetch error");
     return null;
   }
 }
@@ -84890,7 +85330,7 @@ async function fetchMarkets(range = "1d") {
 
 // server/routes/markets.ts
 init_redis();
-var log30 = logger.child({ module: "markets" });
+var log33 = logger.child({ module: "markets" });
 var marketsQuerySchema = z10.object({
   range: z10.enum(["1d", "5d", "1mo", "ytd"]).default("1d")
 });
@@ -84906,24 +85346,24 @@ marketsRouter.get("/", validateQuery(marketsQuerySchema), async (_req, res) => {
     const quotes = await fetchMarkets(range);
     if (quotes.length > 0) {
       await cacheSetSafe(cacheKey2, quotes, MARKETS_REDIS_TTL_SEC);
-      log30.info(
+      log33.info(
         { count: quotes.length, total: 5, range, tickers: quotes.map((q) => q.symbol) },
         "fetched tickers"
       );
       res.json({ data: quotes, stale: false, lastFresh: Date.now() });
     } else if (cached) {
-      log30.warn("all tickers failed, serving stale cache");
+      log33.warn("all tickers failed, serving stale cache");
       res.json({
         data: cached.data,
         stale: true,
         lastFresh: cached.lastFresh
       });
     } else {
-      log30.error("all tickers failed with no cache available");
+      log33.error("all tickers failed with no cache available");
       res.status(502).json({ error: "No market data available", code: "UPSTREAM_ERROR", statusCode: 502 });
     }
   } catch (err) {
-    log30.error({ err }, "upstream error");
+    log33.error({ err }, "upstream error");
     if (cached) {
       res.json({
         data: cached.data,
@@ -85069,7 +85509,7 @@ async function fetchGdeltArticles() {
 
 // server/adapters/rss.ts
 import { XMLParser } from "fast-xml-parser";
-var log31 = logger.child({ module: "rss" });
+var log34 = logger.child({ module: "rss" });
 function stripHtml(html) {
   return html.replace(/<[^>]*>/g, "").trim();
 }
@@ -85129,7 +85569,7 @@ async function fetchAllRssFeeds() {
     if (result.status === "fulfilled") {
       articles.push(...result.value);
     } else {
-      log31.warn({ err: result.reason }, "feed fetch failed");
+      log34.warn({ err: result.reason }, "feed fetch failed");
     }
   }
   return articles;
@@ -85331,7 +85771,7 @@ function filterAndScoreArticles(articles) {
 }
 
 // server/routes/news.ts
-var log32 = logger.child({ module: "news" });
+var log35 = logger.child({ module: "news" });
 var newsQuerySchema = z11.object({
   refresh: z11.enum(["true", "false"]).optional().transform((v) => v === "true")
 });
@@ -85349,11 +85789,11 @@ newsRouter.get("/", validateQuery(newsQuerySchema), async (_req, res) => {
     const [gdeltArticles, rssArticles] = await Promise.all([
       fetchGdeltArticles().catch((err) => {
         gdeltFailed = true;
-        log32.warn({ err }, "GDELT fetch failed (non-fatal, falling back to RSS-only)");
+        log35.warn({ err }, "GDELT fetch failed (non-fatal, falling back to RSS-only)");
         return [];
       }),
       fetchAllRssFeeds().catch((err) => {
-        log32.warn({ err }, "RSS fetch failed (non-fatal)");
+        log35.warn({ err }, "RSS fetch failed (non-fatal)");
         return [];
       })
     ]);
@@ -85383,13 +85823,13 @@ newsRouter.get("/", validateQuery(newsQuerySchema), async (_req, res) => {
     }
     const gdeltCount = gdeltArticles.length;
     const rssCount = rssArticles.length;
-    log32.info(
+    log35.info(
       { gdeltCount, rssCount, clusterCount: clusters.length, gdeltFailed },
       "fetched and clustered news"
     );
     res.json({ data: clusters, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log32.error({ err }, "upstream error");
+    log35.error({ err }, "upstream error");
     if (cached) {
       res.json({ data: cached.data, stale: true, lastFresh: cached.lastFresh });
     } else {
@@ -85431,7 +85871,7 @@ function classifyEventActors(actors, cameoCodebook) {
 }
 
 // server/routes/operator-status.ts
-var log33 = logger.child({ module: "operator-status" });
+var log36 = logger.child({ module: "operator-status" });
 var operatorStatusRouter = Router12();
 var LIMIT_DRILL_DOWN = 20;
 var INLINE_CAMEO_CODES = /* @__PURE__ */ new Set([
@@ -85472,6 +85912,7 @@ var MAX_SCAN_KEYS = 200;
 async function buildDeadUrlSample() {
   try {
     const sample = [];
+    const countsByStatus = {};
     let cursor = 0;
     let scanned = 0;
     do {
@@ -85490,25 +85931,31 @@ async function buildDeadUrlSample() {
         const cached = await cacheGetSafe(key, 999999999);
         const value = cached?.data;
         if (!value) continue;
+        countsByStatus[value.status] = (countsByStatus[value.status] ?? 0) + 1;
         if (!isTerminalDead(value.status)) continue;
+        if (sample.length >= LIMIT_DRILL_DOWN) continue;
         const eventId = key.startsWith(URL_LIVENESS_KEY_PREFIX) ? key.slice(URL_LIVENESS_KEY_PREFIX.length) : key;
         sample.push({
           eventId,
           url: value.lastUrlProbed,
           // Terminal-dead union pinned by `isTerminalDead` — cast narrows
           // the broader `UrlLivenessStatus` type to the dashboard subset.
-          status: value.status
+          status: value.status,
+          // Phase 43 D-19 — source evidence off the stored entry. The
+          // cacheGetSafe<UrlLiveness> read is a TS-generic cast (no runtime
+          // Zod parse here), so pre-Phase-43 entries lacking `evidence`
+          // read as `undefined` — coerce to `null`.
+          evidence: value.evidence ?? null,
+          // Phase 44 D-01 — both already on the stored value (no extra read).
+          lastProbedAt: value.lastProbedAt,
+          attemptCount: value.attemptCount
         });
-        if (sample.length >= LIMIT_DRILL_DOWN) {
-          cursor = 0;
-          break;
-        }
       }
     } while (cursor !== 0 && cursor !== "0");
-    return sample;
+    return { sample, countsByStatus };
   } catch (err) {
-    log33.warn({ err }, "failed to build dead-URL drill-down sample");
-    return [];
+    log36.warn({ err }, "failed to build dead-URL drill-down sample");
+    return { sample: [], countsByStatus: {} };
   }
 }
 operatorStatusRouter.get(
@@ -85521,7 +85968,7 @@ operatorStatusRouter.get(
       try {
         auditMembers = await redis.smembers("operator:audit-log") ?? [];
       } catch (err) {
-        log33.warn({ err }, "failed to read operator:audit-log");
+        log36.warn({ err }, "failed to read operator:audit-log");
       }
       const entries = auditMembers.map((raw) => {
         try {
@@ -85563,18 +86010,18 @@ operatorStatusRouter.get(
           advEval = raw;
         }
       } catch (err) {
-        log33.warn({ err }, "failed to read events:llm-eval-adversarial:v3");
+        log36.warn({ err }, "failed to read events:llm-eval-adversarial:v3");
       }
       let deadUrlCount = 0;
       try {
         const raw = await redis.get(URL_LIVENESS_COUNT_KEY);
         deadUrlCount = Math.max(0, Number(raw) || 0);
       } catch (err) {
-        log33.warn({ err }, "failed to read events:url-liveness-count");
+        log36.warn({ err }, "failed to read events:url-liveness-count");
       }
       const last24hPrunes = last24h.filter((e) => e.operation === "prune-dead-urls").length;
-      const deadUrlSample = await buildDeadUrlSample();
-      const prune = { deadUrlCount, last24hPrunes, deadUrlSample };
+      const { sample: deadUrlSample, countsByStatus } = await buildDeadUrlSample();
+      const prune = { deadUrlCount, last24hPrunes, deadUrlSample, countsByStatus };
       let actorQuality = null;
       try {
         const cached = await cacheGetSafe(
@@ -85629,7 +86076,7 @@ operatorStatusRouter.get(
           };
         }
       } catch (err) {
-        log33.warn({ err }, "failed to compute actorQuality block");
+        log36.warn({ err }, "failed to compute actorQuality block");
       }
       let tokenBudget = null;
       try {
@@ -85653,11 +86100,45 @@ operatorStatusRouter.get(
           costShadow: { tokensIn, tokensOut, usd }
         };
       } catch (err) {
-        log33.warn({ err }, "failed to compute tokenBudget block");
+        log36.warn({ err }, "failed to compute tokenBudget block");
       }
-      res.json({ audit24h, byBearer, advEval, prune, actorQuality, tokenBudget });
+      let trendHistory = null;
+      try {
+        trendHistory = await readTrendHistory();
+      } catch (err) {
+        log36.warn({ err }, "failed to read trendHistory ring");
+      }
+      let rateLimiter = null;
+      try {
+        const now2 = /* @__PURE__ */ new Date();
+        const todayYmd = now2.toISOString().slice(0, 10);
+        const yesterdayYmd = new Date(now2.getTime() - 24 * 60 * 60 * 1e3).toISOString().slice(0, 10);
+        const tiers = await Promise.all(
+          Object.entries(RATE_LIMITER_CONFIG).map(async ([tier, cfg]) => {
+            const [todayRaw, yesterdayRaw] = await Promise.all([
+              redis.get(`ratelimit:429:${tier}:${todayYmd}`),
+              redis.get(`ratelimit:429:${tier}:${yesterdayYmd}`)
+            ]);
+            const recent429 = (Number(todayRaw) || 0) + (Number(yesterdayRaw) || 0);
+            return { tier, max: cfg.max, windowSec: cfg.windowSec, recent429 };
+          })
+        );
+        rateLimiter = { tiers };
+      } catch (err) {
+        log36.warn({ err }, "failed to compute rateLimiter block");
+      }
+      res.json({
+        audit24h,
+        byBearer,
+        advEval,
+        prune,
+        actorQuality,
+        tokenBudget,
+        trendHistory,
+        rateLimiter
+      });
     } catch (err) {
-      log33.error({ err }, "/api/operator-status failed");
+      log36.error({ err }, "/api/operator-status failed");
       res.status(500).json({ error: "operator_status_failed" });
     }
   }
@@ -85667,7 +86148,7 @@ operatorStatusRouter.get(
 init_redis();
 import { timingSafeEqual as timingSafeEqual4 } from "crypto";
 import { Router as Router13 } from "express";
-var log34 = logger.child({ module: "refresh-events-cron" });
+var log37 = logger.child({ module: "refresh-events-cron" });
 var refreshEventsCronRouter = Router13();
 refreshEventsCronRouter.get("/", async (req, res) => {
   if (env.CRON_SECRET) {
@@ -85688,13 +86169,13 @@ refreshEventsCronRouter.get("/", async (req, res) => {
       forceCooldown
     });
     const durationMs = Date.now() - t0;
-    log34.info({ result, durationMs, forceCooldown }, "refresh-events cron dispatched");
+    log37.info({ result, durationMs, forceCooldown }, "refresh-events cron dispatched");
     await cacheSetSafe("cron:lastTick:refresh-events", Date.now(), CRON_LASTTICK_TTL_SEC);
     res.status(200).json({ ok: true, durationMs, ...result });
   } catch (err) {
     const durationMs = Date.now() - t0;
     const message = err instanceof Error ? err.message : String(err);
-    log34.error({ err: message, durationMs }, "refresh-events cron failed");
+    log37.error({ err: message, durationMs }, "refresh-events cron failed");
     res.status(500).json({
       ok: false,
       error: "refresh_failed",
@@ -85774,11 +86255,11 @@ async function collectShips() {
 
 // server/routes/ships.ts
 init_redis();
-var log35 = logger.child({ module: "ships" });
+var log38 = logger.child({ module: "ships" });
 var shipsRouter = Router14();
 var SHIPS_KEY = "ships:ais";
 var LOGICAL_TTL_MS2 = 3e4;
-var REDIS_TTL_SEC2 = 300;
+var REDIS_TTL_SEC = 300;
 var STALE_THRESHOLD_MS2 = 6e5;
 shipsRouter.get("/", async (_req, res) => {
   const cached = await cacheGetSafe(SHIPS_KEY, LOGICAL_TTL_MS2);
@@ -85804,10 +86285,10 @@ shipsRouter.get("/", async (_req, res) => {
       }
     }
     const merged = Array.from(shipMap.values());
-    await cacheSetSafe(SHIPS_KEY, merged, REDIS_TTL_SEC2);
+    await cacheSetSafe(SHIPS_KEY, merged, REDIS_TTL_SEC);
     res.json({ data: merged, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log35.error({ err }, "collectShips error");
+    log38.error({ err }, "collectShips error");
     if (cached) {
       res.json({ ...cached, stale: true });
     } else {
@@ -85820,13 +86301,13 @@ shipsRouter.get("/", async (_req, res) => {
 import { Router as Router15 } from "express";
 import { z as z12 } from "zod";
 init_redis();
-var log36 = logger.child({ module: "sites" });
+var log39 = logger.child({ module: "sites" });
 var sitesQuerySchema = z12.object({
   refresh: z12.enum(["true", "false"]).optional().transform((v) => v === "true")
 });
 var SITES_KEY2 = "sites:v3";
 var LOGICAL_TTL_MS3 = SITES_CACHE_TTL;
-var REDIS_TTL_SEC3 = 259200;
+var REDIS_TTL_SEC2 = 259200;
 var sitesRouter = Router15();
 sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
   const { refresh: forceRefresh } = res.locals.validatedQuery;
@@ -85850,9 +86331,9 @@ sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
       await cacheSetSafe(
         SITES_KEY2,
         { sites: snapshot.sites, filterStats: snapshot.stats },
-        REDIS_TTL_SEC3
+        REDIS_TTL_SEC2
       );
-      log36.info(
+      log39.info(
         { count: snapshot.sites.length, generatedAt: snapshot.generatedAt },
         "serving sites from committed snapshot; Overpass untouched"
       );
@@ -85867,7 +86348,7 @@ sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
   }
   try {
     const { sites, stats } = await fetchSites();
-    await cacheSetSafe(SITES_KEY2, { sites, filterStats: stats }, REDIS_TTL_SEC3);
+    await cacheSetSafe(SITES_KEY2, { sites, filterStats: stats }, REDIS_TTL_SEC2);
     sendValidated(res, sitesResponseSchema, {
       data: sites,
       stale: false,
@@ -85875,7 +86356,7 @@ sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
       filterStats: stats
     });
   } catch (err) {
-    log36.error({ err }, "Overpass error");
+    log39.error({ err }, "Overpass error");
     if (cached) {
       const payload = cached.data;
       sendValidated(res, sitesResponseSchema, {
@@ -85913,7 +86394,7 @@ import { Router as Router17 } from "express";
 import { z as z13 } from "zod";
 
 // server/adapters/open-meteo-precip.ts
-var log37 = logger.child({ module: "open-meteo-precip" });
+var log40 = logger.child({ module: "open-meteo-precip" });
 var REGIONAL_NORMALS_MM = {
   arid: 20,
   // Arabian Peninsula, central Iran, Sahara
@@ -85945,7 +86426,7 @@ async function fetchPrecipitation(locations) {
     }
   }
   const uniqueCells = Array.from(cellMap.values());
-  log37.info(
+  log40.info(
     {
       locations: locations.length,
       uniqueCells: uniqueCells.length,
@@ -85964,7 +86445,7 @@ async function fetchPrecipitation(locations) {
         signal: AbortSignal.timeout(TIMEOUT_MS3)
       });
       if (!res.ok) {
-        log37.warn(
+        log40.warn(
           { batch: Math.floor(i / BATCH_SIZE2), status: res.status },
           "batch returned error, skipping"
         );
@@ -85988,7 +86469,7 @@ async function fetchPrecipitation(locations) {
         });
       }
     } catch (batchErr) {
-      log37.warn({ err: batchErr, batch: Math.floor(i / BATCH_SIZE2) }, "batch failed, skipping");
+      log40.warn({ err: batchErr, batch: Math.floor(i / BATCH_SIZE2) }, "batch failed, skipping");
       continue;
     }
   }
@@ -86005,7 +86486,7 @@ async function fetchPrecipitation(locations) {
       updatedAt: now
     });
   }
-  log37.info(
+  log40.info(
     { cells: cellResults.size, mappedLocations: results.length },
     "precipitation fetch complete"
   );
@@ -86014,7 +86495,7 @@ async function fetchPrecipitation(locations) {
 
 // server/routes/water.ts
 init_redis();
-var log38 = logger.child({ module: "water" });
+var log41 = logger.child({ module: "water" });
 function buildEmptyFilterStats(source, generatedAt) {
   return {
     rawCounts: {},
@@ -86042,7 +86523,7 @@ function buildEmptyFilterStats(source, generatedAt) {
 var waterQuerySchema = z13.object({
   refresh: z13.enum(["true", "false"]).optional().transform((v) => v === "true")
 });
-var FACILITIES_KEY = "water:facilities:v3";
+var FACILITIES_KEY = "water:facilities:v4";
 var PRECIP_KEY = "water:precip";
 function isPrecipEmptySentinel(value) {
   return typeof value === "object" && value !== null && value.failed === true && Array.isArray(value.data);
@@ -86053,12 +86534,12 @@ function normalizePrecipCache(cached) {
 }
 var waterRouter = Router17();
 waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
-  log38.info("GET /api/water hit");
+  log41.info("GET /api/water hit");
   const isCron = req.headers["user-agent"]?.includes("vercel-cron");
   const { refresh } = res.locals.validatedQuery;
   const forceRefresh = refresh && (isCron || process.env.NODE_ENV !== "production");
   const cached = await cacheGetSafe(FACILITIES_KEY, WATER_CACHE_TTL);
-  log38.info(
+  log41.info(
     { cacheHit: !!cached, count: cached?.data.facilities.length, stale: cached?.stale },
     "cache result"
   );
@@ -86104,7 +86585,7 @@ waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
         { facilities: snapshot.facilities, filterStats: snapshot.stats },
         WATER_REDIS_TTL_SEC
       );
-      log38.info(
+      log41.info(
         { count: snapshot.facilities.length, generatedAt: snapshot.generatedAt },
         "serving water facilities from committed snapshot; Overpass untouched"
       );
@@ -86128,7 +86609,7 @@ waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
       filterStats
     });
   } catch (err) {
-    log38.error({ err }, "Overpass error");
+    log41.error({ err }, "Overpass error");
     if (cached) {
       const payload = cached.data;
       sendValidated(res, waterResponseSchema, {
@@ -86142,7 +86623,7 @@ waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
         }
       });
     } else {
-      log38.warn("Overpass failed, returning empty");
+      log41.warn("Overpass failed, returning empty");
       sendValidated(res, waterResponseSchema, {
         data: [],
         stale: true,
@@ -86193,7 +86674,7 @@ waterRouter.get("/precip", validateQuery(waterQuerySchema), async (_req, res) =>
     }
     res.json({ data: precipData, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log38.error({ err }, "precipitation fetch error");
+    log41.error({ err }, "precipitation fetch error");
     if (cachedPrecip) {
       res.json({
         data: normalizePrecipCache(cachedPrecip.data),
@@ -86259,7 +86740,7 @@ async function fetchWeather() {
 
 // server/routes/weather.ts
 init_redis();
-var log39 = logger.child({ module: "weather" });
+var log42 = logger.child({ module: "weather" });
 var weatherRouter = Router18();
 weatherRouter.get("/", async (_req, res) => {
   const cached = await cacheGetSafe(WEATHER_CACHE_KEY, WEATHER_CACHE_TTL);
@@ -86269,10 +86750,10 @@ weatherRouter.get("/", async (_req, res) => {
   try {
     const points = await fetchWeather();
     await cacheSetSafe(WEATHER_CACHE_KEY, points, WEATHER_REDIS_TTL_SEC);
-    log39.info({ count: points.length }, "fetched grid points");
+    log42.info({ count: points.length }, "fetched grid points");
     res.json({ data: points, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log39.error({ err }, "upstream error");
+    log42.error({ err }, "upstream error");
     if (cached) {
       res.json({
         data: cached.data,

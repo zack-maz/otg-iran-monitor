@@ -55,8 +55,9 @@ describe('adsb.lol Adapter', () => {
     expect(url).toBe('https://api.adsb.lol/v2/lat/28/lon/45/dist/1200');
     // No trailing slash
     expect(url).not.toMatch(/\/$/);
-    // No auth headers -- only signal for timeout
-    expect(options?.headers).toBeUndefined();
+    // No auth headers -- but an explicit User-Agent (adsb.lol 403s Node's default `node` UA)
+    expect(options?.headers?.Authorization).toBeUndefined();
+    expect(options?.headers?.['User-Agent']).toMatch(/^otg-iran-monitor\//);
     expect(options?.signal).toBeDefined();
   });
 

@@ -49,14 +49,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Codebook is the single source of truth for orphan-check (D-07 b).
-// Phase 38 LLM-FIX (CI-green companion) — repointed to the v1.5-phases archive.
-// The Phase 33 directory was archived from .planning/phases/ to
-// .planning/milestones/v1.5-phases/ at v1.5 close, leaving this resolve()
-// pointing at a deleted path (the sole failing suite on current main).
-const codebookPath = resolve(
-  __dirname,
-  '../../../.planning/milestones/v1.5-phases/33-actor-metadata-audit-canonical-catalog-eval-expansion/cameo-codes.json',
-);
+const codebookPath = resolve(__dirname, '../fixtures/cameo-codes.json');
 const codebook = JSON.parse(readFileSync(codebookPath, 'utf-8')) as {
   version: string;
   actorCodes: Array<{ code: string; label: string; type: string }>;

@@ -2,7 +2,37 @@
 
 All notable changes to the Iran Monitor project.
 
-## [v1.6] — Production Hardening — 🚧 in progress
+## [Unreleased] — branch `chore/overhaul-2026-09` (2026-09-17)
+
+Audit of production, code and docs after ~12 weeks unattended. Full findings: [docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md).
+
+### Fixed
+
+- **Flights down in production.** adsb.lol returns 403 to Node's default `User-Agent`; the adapter now sends `OUTBOUND_USER_AGENT`.
+- **LLM event pipeline produced nothing for months.** The refresh-events cron read `events:gdelt` cache-only, and only a browser visit wrote that key. The cron now refreshes raw GDELT itself through the shared `refreshRawEvents` (`server/lib/rawEventsRefresh.ts`), never runs the history backfill, and does not persist a backfill-less set into an empty accumulator.
+- **`/api/events` re-downloaded GDELT on every request** whenever an LLM key was configured and the enriched cache was cold or stale.
+- **News context was always empty.** The LLM prompt's news block, the corroboration boost and the Bellingcat boost read `news:gdelt`, a key with no writer; they now read `news:feed`.
+- **Per-endpoint rate limiters shared one per-IP counter.** Each tier now has its own Redis prefix. The limiter also degrades open on Upstash errors instead of returning 500.
+- **Request logs leaked Vercel platform headers** (`x-vercel-oidc-token`, `x-vercel-proxy-signature`, `forwarded`); now redacted.
+
+### Changed
+
+- Documentation rewritten: `README.md`, `CLAUDE.md`, new `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, single Redis registry at `docs/redis-keys.md`, `docs/AUDIT-2026-09.md`. Removed `PROJECT_STATUS.md`, `PROJECT_SPEC.md`, `docs/architecture/`, `docs/runbook.md`, `docs/degradation.md`, `docs/operator-guide.md`, `docs/concepts.md`, `docs/COSTS.md`, `docs/superpowers/`, `docs/brainstorms/`. Essays moved to `docs/portfolio/`.
+- Pre-v2.0 planning history (`.planning/milestones`, `debug`, `quick`, `todos`) removed from the working tree; preserved at git tag `planning-archive-2026-09`.
+- Eval fixtures moved from `.planning/eval/` to `server/data/eval/`; CAMEO codebook fixture to `src/__tests__/fixtures/`; snapshot/probe scripts write to `.snapshots/`.
+- Redis registry drift test gates `docs/redis-keys.md` only (no second copy in `CLAUDE.md`). Removed `docs-exist.test.ts`.
+
+## [v2.0] — Final Hardening — 🚧 in progress (started 2026-06-09)
+
+Phases 42–46 shipped to production 2026-06-10 → 2026-06-22. Phases 47–48 (load test, load remediation) not started.
+
+- **Water filter fix (42):** name-aware, deterministic `spatialDedup`; cache key `water:facilities:v3` → `v4`; snapshot grew from 304 to 460 facilities.
+- **Ghost-link prune correctness (43):** soft-404 body heuristic, `no-url` status, `unknown` never pruned, 403 excluded from cron auto-prune, per-event evidence strings.
+- **Events subtab pipeline detail (44):** LLM status blocks mounted in the events subtab; dead-URL counter reconcile (`reconcileDeadUrlCount`).
+- **Dashboard subtab readability (45):** tabular numerics, hierarchy, trend sparklines from `dashboard:trends:history`.
+- **General hardening (46):** per-tier 429 counters, cron missed-run detection on `/api/health`, cron-watch ring (never read — see audit), test backfill.
+
+## [v1.6] — Production Hardening — 2026-06-09
 
 **Span:** 2026-06-03 → 2026-06-05 (4 phases: 38 live-state verification, 39 LLM observability, 40 API-Health consolidation, 41 public-reveal polish). The v1.5-close code-side punch-list was fully resolved in Phase 38 — the residual v1.6 cleanup proved to be a pure docs sweep, completed alongside the reveal in Phase 41 (see `.planning/phases/41-public-reveal-polish/41-AUDIT.md`).
 
@@ -126,7 +156,7 @@ GDELT pipeline rebuilt around a structured LLM extraction layer (Cerebras → Gr
 
 ---
 
-## [Unreleased]
+## [v1.4 detail] — per-phase notes, Phases 27–28.2.7 (shipped in v1.4)
 
 ### Phase 28.2.7: Audit-tier Completeness (2026-05-07 → 2026-05-08)
 

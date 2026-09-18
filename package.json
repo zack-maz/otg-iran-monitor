@@ -10,7 +10,7 @@
     "dev": "concurrently -n client,server -c blue,green \"npm:dev:client\" \"npm:dev:server\"",
     "dev:client": "vite",
     "dev:server": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx/esm --watch server/index.ts",
-    "build": "vite build && tsup server/vercel-entry.ts --format esm --out-dir api --no-splitting --tsconfig tsconfig.server.json && mkdir -p api/_eval && cp .planning/eval/ground-truth-events.json .planning/eval/adversarial-injections.json api/_eval/",
+    "build": "vite build && tsup server/vercel-entry.ts --format esm --out-dir api --no-splitting --tsconfig tsconfig.server.json && mkdir -p api/_eval && cp server/data/eval/ground-truth-events.json server/data/eval/adversarial-injections.json api/_eval/",
     "typecheck": "tsc -b && type-coverage",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
@@ -36,7 +36,7 @@
     "type-coverage": "type-coverage",
     "preview": "vite preview",
     "openapi:lint": "redocly lint server/openapi.yaml --format=stylish",
-    "docs:lint": "markdown-link-check --quiet --config .markdown-link-check.json README.md && find docs -name '*.md' -not -path '*/brainstorms/*' -not -path '*/superpowers/*' -print0 | xargs -0 -n1 markdown-link-check --quiet --config .markdown-link-check.json",
+    "docs:lint": "markdown-link-check --quiet --config .markdown-link-check.json README.md CLAUDE.md && find docs -name '*.md' -not -path '*/portfolio/*' -print0 | xargs -0 -n1 markdown-link-check --quiet --config .markdown-link-check.json",
     "prepare": "husky"
   },
   "typeCoverage": {

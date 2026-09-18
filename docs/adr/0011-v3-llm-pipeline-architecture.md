@@ -163,7 +163,7 @@ reader of ADR-0011 alone gets the current shipped state.
 **Runtime cascade as shipped (post-Phase-34):**
 
 - **NIM** (qwen-235b instruct) — the only LLM provider invoked at runtime.
-  See [`docs/architecture/llm-pipeline-reliability.md`](../architecture/llm-pipeline-reliability.md)
+  See `docs/architecture/llm-pipeline-reliability.md`
   §"Multi-Provider Cascade (Phase 34)" for the cascade-shape table.
 - **OpenRouter** — DORMANT per [ADR-0010 Phase 30.1 sub-block](0010-v1-5-llm-pipeline-narrowing-and-deletion.md#phase-301-sub-block-appended-2026-05-17).
   `skipOpenRouter: true` at `server/lib/llmEventExtractor.v3.ts:622, 929`.
@@ -185,7 +185,7 @@ architectural rework is required to wake them.
 **Cross-references:**
 
 - [ADR-0010](0010-v1-5-llm-pipeline-narrowing-and-deletion.md) — narrowing decisions per phase.
-- [`docs/architecture/llm-pipeline-reliability.md`](../architecture/llm-pipeline-reliability.md) — current cascade-shape table.
+- `docs/architecture/llm-pipeline-reliability.md` — current cascade-shape table.
 - [CLAUDE.md §LLM Event Pipeline](../../CLAUDE.md) — operator skim.
 - Phase 36 SUMMARY.md — full Phase 36 close-out context.
 

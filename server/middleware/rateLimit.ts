@@ -75,10 +75,14 @@ export function createRateLimiter(
   prefix: string = 'ratelimit:prod',
   tierName?: string,
 ) {
+  // The tier name MUST be part of the Redis prefix: @upstash/ratelimit keys on
+  // `${prefix}:${identifier}` only, so tiers sharing a bare prefix share ONE
+  // per-IP counter — 12 flights polls/min were being counted against the
+  // 10/min sites/water/weather/geocode limits (found 2026-09).
   const limiter = new Ratelimit({
     redis,
     limiter: Ratelimit.slidingWindow(maxRequests, `${windowSec} s`),
-    prefix,
+    prefix: tierName ? `${prefix}:${tierName}` : prefix,
   });
 
   return async function rateLimitHandler(
@@ -137,7 +141,15 @@ export function createRateLimiter(
 
     const identifier = req.ip ?? (req.headers['x-forwarded-for'] as string) ?? 'anonymous';
 
-    const result = await limiter.limit(identifier);
+    // Degrade-open: an Upstash error must not turn every /api/* request into a
+    // 500 in front of routes that can still serve from cache.
+    let result: Awaited<ReturnType<typeof limiter.limit>>;
+    try {
+      result = await limiter.limit(identifier);
+    } catch {
+      next();
+      return;
+    }
 
     res.set('X-RateLimit-Limit', String(result.limit));
     res.set('X-RateLimit-Remaining', String(result.remaining));

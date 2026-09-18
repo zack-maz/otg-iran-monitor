@@ -9,6 +9,8 @@ lerna-debug.log*
 
 node_modules
 .dev-cache
+# Output of scripts/snapshot-*.ts and scripts/probe-openrouter.ts
+.snapshots
 dist
 dist-server
 # NOTE: api/vercel-entry.js is the tsup-bundled serverless function entry

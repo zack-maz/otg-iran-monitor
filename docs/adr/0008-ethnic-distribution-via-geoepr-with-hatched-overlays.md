@@ -193,9 +193,9 @@ canvas-generated diagonal hatch atlas.
   `EthnicGroup` type and `ETHNIC_GROUPS` metadata record.
 - [`src/components/map/layers/EthnicOverlay.tsx`](../../src/components/map/layers/EthnicOverlay.tsx) —
   canvas hatch atlas + stacked GeoJsonLayer rendering logic.
-- [`src/components/map/EthnicTooltip.tsx`](../../src/components/map/EthnicTooltip.tsx) —
+- [`src/components/map/layers/EthnicOverlay.tsx`](../../src/components/map/layers/EthnicOverlay.tsx) (contains `EthnicTooltip`) —
   hover tooltip with group name, population, context.
-- [`docs/architecture/frontend.md`](../architecture/frontend.md) —
+- `docs/architecture/frontend.md` —
   deck.gl layer stacking diagram showing ethnic layers after
   political in the z-order.
 - [GeoEPR 2021 dataset page](https://icr.ethz.ch/data/epr/geoepr/) —

@@ -113,10 +113,10 @@ decision every six months.
   in the successor ADR.
 
 **Scope.** ADRs document _decisions_, not _designs_. Architecture
-diagrams live in [`docs/architecture/`](../architecture/README.md);
+diagrams live in `docs/architecture/`;
 the runbook for operational failure modes lives in
-[`docs/runbook.md`](../runbook.md); the graceful degradation contract
-lives in [`docs/degradation.md`](../degradation.md). This directory is
+`docs/runbook.md`; the graceful degradation contract
+lives in `docs/degradation.md`. This directory is
 specifically the "why we chose X over Y" layer.
 
 **What qualifies for an ADR?** A decision is ADR-worthy if answering

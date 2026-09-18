@@ -48,16 +48,14 @@ const log = logger.child({ module: 'llm-eval-harness' });
 // Module-relative path to the curated ground-truth file committed in Task 1
 // of this plan. Matches the path used at commit time (0c5ec8c).
 //
-// Phase 31 D-02 fix-forward: vercel.json `includeFiles` cannot bundle the
-// `.planning/eval/*.json` fixtures into the serverless function (the bundler
-// silently skips dotfile-prefixed directories regardless of glob form). The
-// build step copies the fixtures to `api/_eval/*.json`; in the deployed
-// function `__dirname` is `<lambda>/api`, so `./_eval/...` resolves cleanly.
-// For local dev (`tsx` from source) the original `../../.planning/eval/...`
-// path still works. We probe both candidates and pick whichever exists.
+// Fixture resolution: tsup does not copy data files, so the build step copies
+// `server/data/eval/*.json` to `api/_eval/*.json` (shipped via vercel.json
+// `includeFiles`). In the deployed function `__dirname` is `<lambda>/api`, so
+// `./_eval/...` resolves; under local `tsx` the `../data/eval/...` path does.
+// We probe both candidates and pick whichever exists.
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GROUND_TRUTH_CANDIDATES = [
-  resolve(__dirname, '../../.planning/eval/ground-truth-events.json'), // dev (tsx src)
+  resolve(__dirname, '../data/eval/ground-truth-events.json'), // dev (tsx src)
   resolve(__dirname, '_eval/ground-truth-events.json'), // prod (api/_eval/ bundled)
 ];
 /** Probed lazily inside loadGroundTruth() so module load stays side-effect-free
@@ -447,7 +445,7 @@ export async function runEval(opts: { model?: string } = {}): Promise<EvalScore>
 // constraints + non-leakage of injection content) are stack-fixed; the
 // resolver path is sufficient surface to score them.
 //
-// The fixture lives at .planning/eval/adversarial-injections.json (sibling
+// The fixture lives at server/data/eval/adversarial-injections.json (sibling
 // to ground-truth-events.json) — 10 entries spanning 5 prompt-injection
 // categories. PASS criterion per fixture entry: (a) the resolver returned
 // a coord, (b) the locationHierarchyV2 input still parses Zod-strict, AND
@@ -464,7 +462,7 @@ export async function runEval(opts: { model?: string } = {}): Promise<EvalScore>
  *  resolveGroundTruthPath (see note above). Lazy so module load is
  *  side-effect-free for vi.mock('node:fs', ...). */
 const ADVERSARIAL_FIXTURE_CANDIDATES = [
-  resolve(__dirname, '../../.planning/eval/adversarial-injections.json'), // dev
+  resolve(__dirname, '../data/eval/adversarial-injections.json'), // dev
   resolve(__dirname, '_eval/adversarial-injections.json'), // prod bundled
 ];
 function resolveAdversarialFixturePath(): string {

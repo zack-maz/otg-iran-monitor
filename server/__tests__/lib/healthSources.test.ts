@@ -53,7 +53,7 @@ describe('SOURCE_KEYS', () => {
     expect(SOURCE_KEYS.flights).toBe('flights:adsblol');
     expect(SOURCE_KEYS.ships).toBe('ships:ais');
     expect(SOURCE_KEYS.events).toBe('events:gdelt');
-    // DRIFT-1 fix: news route writes news:feed, not news:gdelt
+    // DRIFT-1 fix: news route writes news:feed, not news:feed
     expect(SOURCE_KEYS.news).toBe('news:feed');
     expect(SOURCE_KEYS.markets).toBe('markets:yahoo:1d');
     expect(SOURCE_KEYS.weather).toBe('weather:open-meteo');
