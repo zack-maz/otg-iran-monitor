@@ -84,9 +84,10 @@ npm run docs:lint      # markdown link check
 | `server/middleware/rateLimit.ts`                         | `@upstash/ratelimit` tiers, one Redis prefix per tier                      |
 | `server/routes/events.ts`                                | `/api/events` + LLM status/history/replay/prune endpoints                  |
 | `server/lib/rawEventsRefresh.ts`                         | GDELT fetch → merge → backfill → `events:gdelt` (shared by route and cron) |
-| `server/lib/llmExtractionPipeline.ts`                    | Cron entry: dispatch decision, run, terminal write                         |
+| `server/lib/llmExtractionPipeline.ts`                    | Cron entry: dispatch decision, then waves of extract → geocode → persist   |
 | `server/lib/llmEventExtractor.v3.ts`                     | Prompting, batching, validation                                            |
-| `server/lib/freeClaudeRouter.ts`                         | `callLLM`: NVIDIA NIM client, retry, rate window                           |
+| `server/lib/freeClaudeRouter.ts`                         | `callLLM`: NVIDIA NIM client, production model id, retry, rate window      |
+| `server/routes/llm-probe-cron.ts`                        | `/api/cron/llm-probe`: try candidate NIM models with the production key    |
 | `server/lib/llmResolver.ts`                              | Location hierarchy → coordinates, always with provenance                   |
 | `server/adapters/*`                                      | One file per upstream                                                      |
 | `vercel.json`                                            | 3 daily crons, rewrites, `maxDuration: 800`                                |
@@ -98,6 +99,10 @@ npm run docs:lint      # markdown link check
 - Event location precision: `exact | neighborhood | city | region`, drawn as radius rings.
 - API responses are `{ data, stale, lastFresh }`.
 
-## State of the project (2026-09-17)
+## State of the project (2026-09-19)
 
-Milestone v2.0 "Final Hardening": phases 42–46 done; 47 (load test) and 48 (load remediation) not started. Production had been unattended since 2026-06-22. The September audit found flights down, the LLM pipeline producing nothing, and several latent bugs; the outage fixes are on branch `chore/overhaul-2026-09`. Read [docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md) before planning new work — the LLM pipeline needs structural changes, not more features.
+Milestone v2.0 "Final Hardening": phases 42–46 done; 47 (load test) and 48 (load remediation) not started. Production was unattended from 2026-06-22 to the September audit ([docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)), which found flights down and the LLM pipeline producing nothing. The pipeline's causes were stacked: the cron depended on a browser visit (L1), NVIDIA retired the model on 2026-07-27 (L8), and the run could neither survive throttling nor finish inside 800 s (L3–L6). All are fixed as of 2026-09-19; the model is `google/gemma-4-31b-it`. Still open: L2 — health stays green when the cron declines or fails, so check `llm-history` or the logs, not the health row.
+
+**NIM will retire this model too.** The symptom is every batch failing within seconds and a run that ends `error` with `HTTP 410`. The playbook is docs/OPERATIONS.md §3.3 step 4; pick the replacement with `/api/cron/llm-probe`, never from NIM's catalog.
+
+**Production secrets are write-only.** Every Production env var is Sensitive in Vercel: `vercel env pull` yields empty strings and nothing can be read back. Anything that needs the real NIM key or Redis has to run in production (hence the probe route) — or rotate the secret.
