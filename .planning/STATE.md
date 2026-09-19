@@ -19,7 +19,7 @@ progress:
 
 # Project State
 
-> **2026-09-17 — read first.** This file was last maintained on 2026-06-22 and contradicts itself below (status tables for v1.6/v2.0 were never rolled forward; "Redis budget ~92%" is a March-era note). Actual position: v2.0 phases 42–46 are complete; 47 (load test) and 48 (load remediation) are not started; 49 (docs cleanup) was delivered out of band by the 2026-09-17 overhaul on branch `chore/overhaul-2026-09` (unmerged). Production findings and the recommended order of work are in `docs/AUDIT-2026-09.md`. A condensed replacement for this file is proposed at `.planning/STATE.proposed.md` — it was not applied because the GSD planning write-guard blocks large shrinks of this file; apply it yourself if you want it (`GSD_ALLOW_PLANNING_SHRINK=1`). Pre-v2.0 phase history referenced below now lives at git tag `planning-archive-2026-09`, not in the working tree.
+> **2026-09-17 — read first.** This file was last maintained on 2026-06-22 and contradicts itself below (status tables for v1.6/v2.0 were never rolled forward; "Redis budget ~92%" is a March-era note). Actual position: v2.0 phases 42–46 are complete; 47 (load test) and 48 (load remediation) are not started; 49 (docs cleanup) was delivered out of band by the 2026-09-17 overhaul on branch `chore/overhaul-2026-09` (merged to `main` 2026-09-18). **2026-09-19:** the LLM event pipeline works in production again — NVIDIA had retired the model; it is now `google/gemma-4-31b-it`, and runs persist in checkpointed waves (branch `fix/nim-model-eol`, merged; ADR-0012). Production findings and the recommended order of work are in `docs/AUDIT-2026-09.md`. A condensed replacement for this file is proposed at `.planning/STATE.proposed.md` — it was not applied because the GSD planning write-guard blocks large shrinks of this file; apply it yourself if you want it (`GSD_ALLOW_PLANNING_SHRINK=1`). Pre-v2.0 phase history referenced below now lives at git tag `planning-archive-2026-09`, not in the working tree.
 
 ## Project Reference
 
@@ -32,8 +32,8 @@ See: .planning/PROJECT.md
 Phase: 46 (General Hardening + Cron Watch Start) — COMPLETE (merged 2026-06-22)
 Plan: 5 of 5
 Status: Phase complete. The CRON-WATCH-01 7-day watch was never read (`cron:watch:v2` has no reader).
-Next: Phase 47 (~100-User Load Test) — not planned. Read `docs/AUDIT-2026-09.md` first; it recommends a recovery phase before the load test.
-Last activity: 2026-09-17 — production/code/docs audit, outage fixes, documentation overhaul (branch `chore/overhaul-2026-09`)
+Next: Phase 47 (~100-User Load Test) — not planned. Read `docs/AUDIT-2026-09.md` §6 first: honest health (L2), green CI and the events read path (L9) come before a load test.
+Last activity: 2026-09-19 — LLM pipeline recovered in production (audit L3–L6, L8 fixed; 716 enriched events served); docs, ADR-0012 and audit statuses rolled forward. Before that, 2026-09-17/18 — audit, outage fixes, documentation overhaul (`chore/overhaul-2026-09`, merged)
 
 Progress: [██████████] 100%
 

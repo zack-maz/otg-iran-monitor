@@ -152,11 +152,11 @@ GDELT export ─ parseAndFilter ─► events:gdelt ─┬─► GET /api/events
                  ─ corroboration/compositeScore ─► events:llm:v3 ─► GET /api/events (preferred)
 ```
 
-**Read path.** `GET /api/events` never calls the LLM. It serves `events:llm:v3` when present (flagged `stale` once older than 15 minutes, which with a daily writer is almost always), otherwise `events:gdelt`, refreshing GDELT only when the raw cache is past its logical TTL. Enriched and raw sets are not merged: if the enriched cache exists, it alone is served.
+**Read path.** `GET /api/events` never calls the LLM. It serves `events:llm:v3` when present (flagged `stale` once older than 15 minutes, which with a daily writer is almost always), otherwise `events:gdelt`, refreshing GDELT only when the raw cache is past its logical TTL. The enriched cache fills a wave at a time and may cover only part of the corpus, so the response is `fillWithRawEvents(enriched, raw)` (`server/lib/eventGrouping.ts`): every enriched event plus the raw rows of each group that has no enriched event yet. Served alone, a half-filled enriched cache would shrink the map to the first wave. If GDELT is down and there is no raw cache, the enriched cache is served on its own. The merge regroups the raw corpus on every uncached request (1.0–1.8 s measured; open item L9 in the audit); the CDN's 15-minute cache absorbs it.
 
 **Write path.** `runRefreshExtraction` (`server/lib/llmExtractionPipeline.ts`) is called only by `server/routes/refresh-events-cron.ts` (Bearer `CRON_SECRET`; `?force=true` skips the cooldown). Steps: cold-cache probe (empty `events:llm:v3` bypasses the 15-minute cooldown in `events:llm-process-ts`) → LLM-configured check → `refreshRawEvents({ skipBackfill: true })` → busy check → stamp cooldown → run the body under `safeWaitUntil`. The body: `dedupHighConfidence` (same day, same actor pair, same CAMEO root, ≤ 5 km, title Jaccard ≥ 0.85) → `groupGdeltRows` (same day, same CAMEO root, centroid ≤ 50 km) → keep only groups whose `llm-v3-{key}` id is not already cached → order by severity → **waves** → `runEval()` if time remains → run record → URL-liveness probe sweep.
 
-**Waves.** A cold corpus (~1,100 groups) does not fit in the 800 s function limit, so the run never depends on finishing. It takes `LLM_V3_CONCURRENCY × 4` groups at a time: `processEventGroupsV3` → `geocodeEnrichedEventsV3` → corroboration against `news:feed` and `compositeScore` → `mergeAndPersistLlmEntities` (merge by id into `events:llm:v3`, 48 h TTL). Geocoding is sequential (Nominatim, 1 req/s) and is the slow half, so wave N+1's LLM calls overlap wave N's geocoding, with at most one wave waiting. Budgets count from the start of the cron request: no new LLM wave after 480 s, geocoding stops at 660 s, the eval starts only before 540 s. Whatever is left is picked up by the next run, because its groups are still missing from the cache; the corpus fills over a few runs, highest severity first. The write goes through `cacheSetReported` (20 s timeout, outcome returned) — a run that persists nothing ends `error`, never `completed`. Group keys are content-derived (`grp-{day}-{cameoRoot}-{lowest GDELT event id}`); a positional key would shift with every corpus change and defeat the diff.
+**Waves.** A cold corpus (~1,100 groups) does not fit in the 800 s function limit, so the run never depends on finishing. It takes `LLM_V3_CONCURRENCY × 4` groups at a time: `processEventGroupsV3` → `geocodeEnrichedEventsV3` → corroboration against `news:feed` and `compositeScore` → `mergeAndPersistLlmEntities` (merge by id into `events:llm:v3`, 48 h TTL). Geocoding is sequential (Nominatim, 1 req/s) and is the slow half, so wave N+1's LLM calls overlap wave N's geocoding, with at most one wave waiting. Budgets count from the start of the cron request: no new LLM wave after 480 s, geocoding stops at 660 s, the eval starts only before 540 s. Whatever is left is picked up by the next run, because its groups are still missing from the cache; the corpus fills over a few runs, highest severity first. The write goes through `cacheSetReported` (20 s timeout, outcome returned) — a run that persists nothing ends `error`, never `completed`. Group keys are content-derived (`grp-{day}-{cameoRoot}-{lowest GDELT event id}`); a positional key would shift with every corpus change and defeat the diff. The reasoning, and what this replaced, is in [ADR-0012](./adr/0012-checkpointed-waves-and-read-path-top-up.md).
 
 **Why the cron is the only writer.** Vercel freezes a function as soon as the response is sent. The earlier design started extraction from `/api/events` as a fire-and-forget promise; in production it never ran and logged nothing. Do not add extraction, or any write to `events:llm:v3`, to a request path. `events:llm:v3` holds a bare `ConflictEventEntity[]`, never an envelope ([ADR-0009](./adr/0009-two-key-split-for-llm-partial-progress-vs-terminal-reads.md)).
 
@@ -179,18 +179,15 @@ GDELT export ─ parseAndFilter ─► events:gdelt ─┬─► GET /api/events
 | Circuit breaker                        | 10-call window, > 30 % errors ⇒ 5 min pause. Applied only when a second provider has a key                 | code, `llmCircuitBreaker.ts` |
 | Cron cooldown                          | 15 min (`events:llm-process-ts`)                                                                           | code                         |
 
-Measured on NIM (two runs, May 2026): p50 batch ≈ 20 s, p95 ≈ 33 s, zero 429s at concurrency 12 over ~213 batches. A month earlier, concurrency above 1 tripped 429s: NIM throttles in bursts shorter than its documented 40/min and its behaviour changes. The defaults are defensive, not fitted. The first lever under sustained throttling is lower concurrency.
+Measured on NIM with `gemma-4-31b-it` (six production runs, 2026-09-19): ~15 s per 2-group batch when idle, a 45–90 s tail under a sustained run, no 429s at concurrency 8. The request timeout is 90 s and a timeout is not retried: at 45 s with one retry a run lost 6–11 batches, at 90–120 s it lost 0–1, and a lost batch is simply taken by the next run. One run covers 130–190 groups in its 480 s LLM budget; the cold corpus (745 groups that day) took six runs. NIM's behaviour changes month to month (in May 2026 the retired qwen model ran p50 ≈ 20 s at concurrency 12; a month before that, any concurrency above 1 tripped 429s), so re-measure with the probe before tuning. The first lever under sustained throttling is lower concurrency.
 
 **Eval.** `runEval()` (`server/lib/llmEvalHarness.ts`) replays 50 ground-truth events through the resolver only (no LLM calls) and scores distance at 5/20/100 km into `events:llm-eval-baseline:v3`. It measures geocoder stability more than extraction quality. If the fixtures are missing from the bundle it scores 0 of 0 without failing; that is why the build copies them to `api/_eval/`.
 
-**Current state: producing nothing.** `events:llm:v3` has been empty in production for months. The first cause is fixed on the overhaul branch: the cron read `events:gdelt` cache-only, and only a browser visit wrote that key. Remaining structural problems, detailed in [`AUDIT-2026-09.md`](./AUDIT-2026-09.md):
+**Current state: working (since 2026-09-19).** `events:llm:v3` was empty in production from roughly June to 2026-09-19. Three causes were stacked, each hiding the next: the cron read `events:gdelt` cache-only and only a browser visit wrote that key; NVIDIA retired the model on 2026-07-27; and the run could neither survive throttling nor finish inside 800 s. All are fixed ([`AUDIT-2026-09.md`](./AUDIT-2026-09.md), L1 and L3–L8). What remains open:
 
-- A cold run processes every group since `WAR_START`, then geocodes sequentially, then runs the eval, and only then writes once. It cannot finish inside 800 s, nothing is checkpointed, and the next night starts cold again.
-- That single write goes through `cacheSetSafe`: 2 s timeout, errors swallowed, "persisted" logged regardless.
-- With one provider, the circuit breaker and the request window skip calls instead of waiting. A burst of errors turns the rest of the run into instant failures. The OpenAI client's own retries multiply the router's three attempts.
-- Group keys end in a positional index (`grp-{day}-{cameoRoot}-{n}`), so they shift whenever the corpus changes. The "only new groups" diff mostly misses, and merge-by-id can attach one event's enrichment to another.
-- The cron responds 200 and writes `cron:lastTick:refresh-events` even when it declines to run (`cooldown`, `no_raw_events`, `pipeline_busy`, `llm_unconfigured`). Read `dispatched` and `reason` in the response body; `llm:runs:history` is the honest record.
-- Around the core job sit several recorders and guards (token budget, lineage, DLQ, call/run history, cost shadow, cron watch, URL-liveness sweep) that did not reveal any of this. The audit recommends collapsing them.
+- The cron responds 200 and writes `cron:lastTick:refresh-events` even when it declines to run (`cooldown`, `no_raw_events`, `pipeline_busy`, `llm_unconfigured`) or fails, so health stays green (L2). Read `dispatched` and `reason` in the response body; `llm:runs:history` and the logs are the honest record.
+- The read path is heavy (L9, above).
+- Around the core job sit several recorders and guards (token budget, lineage, DLQ, call/run history, cost shadow, cron watch, URL-liveness sweep) that revealed none of the above. The audit recommends collapsing them.
 
 ## 6. Vercel deployment
 
@@ -287,29 +284,29 @@ Vite + React + TypeScript (strict), Tailwind v4 (CSS-first `@theme` in `src/styl
 
 ## 9. Glossary
 
-| Term                 | Meaning                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Accumulator          | `events:gdelt`: merge-by-id set of raw events since `WAR_START`, not a snapshot of the latest file           |
-| ActionGeo            | GDELT's own geocode for an event; often a city or country centroid                                           |
-| CAMEO                | GDELT's event code scheme. Roots 18/19/20 (assault, fight, mass violence) are kept                           |
-| Cold-cache self-heal | The cron ignores its cooldown when `events:llm:v3` is empty                                                  |
-| Crossover            | Zoom 8: below it threat clusters lead, above it individual events                                            |
-| Degraded             | Response served from the in-memory fallback because Redis failed                                             |
-| Degrade-open         | On a dependency error the feature steps aside and the request proceeds (rate limiter, counters, recorders)   |
-| DLQ                  | `events:llm-dlq`: bounded set of groups whose extraction failed. Nothing re-drives it                        |
-| Drift gate           | A test that fails when two copies of a fact diverge (domain constants, Redis key registry, OpenAPI lint)     |
-| FIPS                 | FIPS 10-4 country codes used by GDELT. Not ISO                                                               |
-| Flight recorder      | `llm:calls:history` and `llm:runs:history`: Redis lists of recent LLM calls and runs                         |
-| Goldstein            | GDELT's −10…+10 conflict/cooperation scale                                                                   |
-| Logical / hard TTL   | Age after which data is `stale` / Redis expiry. Hard is normally 10× logical                                 |
-| Lost contact         | Detail-panel state when the selected entity left the feed; last-known values stay, greyed                    |
-| Pitfall 1 bridge     | Code-comment name for `/api/events` falling back from `events:llm:v3` to raw GDELT                           |
-| Precision            | `exact / neighborhood / city / region` confidence of an enriched event's location                            |
-| Provenance           | Which resolver path produced a coordinate                                                                    |
-| Sidecar              | A small counter key kept next to a key family so the dashboard avoids scanning (`events:url-liveness-count`) |
-| Snapshot             | Committed JSON of sites or water facilities meant as a cold-start floor; not shipped to production today     |
-| Soft-404             | A page that returns 200 but says "not found"; detected by a body heuristic in `server/lib/urlLiveness.ts`    |
-| Stale                | Older than the logical TTL, still served                                                                     |
-| Terminal write       | The single end-of-run write of `events:llm:v3`                                                               |
-| Unidentified         | Flight with no callsign (hex only)                                                                           |
-| `WAR_START`          | 2026-02-28 UTC. Lower bound for events and the default date filter                                           |
+| Term                 | Meaning                                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Accumulator          | `events:gdelt`: merge-by-id set of raw events since `WAR_START`, not a snapshot of the latest file            |
+| ActionGeo            | GDELT's own geocode for an event; often a city or country centroid                                            |
+| CAMEO                | GDELT's event code scheme. Roots 18/19/20 (assault, fight, mass violence) are kept                            |
+| Cold-cache self-heal | The cron ignores its cooldown when `events:llm:v3` is empty                                                   |
+| Crossover            | Zoom 8: below it threat clusters lead, above it individual events                                             |
+| Degraded             | Response served from the in-memory fallback because Redis failed                                              |
+| Degrade-open         | On a dependency error the feature steps aside and the request proceeds (rate limiter, counters, recorders)    |
+| DLQ                  | `events:llm-dlq`: bounded set of groups whose extraction failed. Nothing re-drives it                         |
+| Drift gate           | A test that fails when two copies of a fact diverge (domain constants, Redis key registry, OpenAPI lint)      |
+| FIPS                 | FIPS 10-4 country codes used by GDELT. Not ISO                                                                |
+| Flight recorder      | `llm:calls:history` and `llm:runs:history`: Redis lists of recent LLM calls and runs                          |
+| Goldstein            | GDELT's −10…+10 conflict/cooperation scale                                                                    |
+| Logical / hard TTL   | Age after which data is `stale` / Redis expiry. Hard is normally 10× logical                                  |
+| Lost contact         | Detail-panel state when the selected entity left the feed; last-known values stay, greyed                     |
+| Pitfall 1 bridge     | Code-comment name for `/api/events` falling back from `events:llm:v3` to raw GDELT                            |
+| Precision            | `exact / neighborhood / city / region` confidence of an enriched event's location                             |
+| Provenance           | Which resolver path produced a coordinate                                                                     |
+| Sidecar              | A small counter key kept next to a key family so the dashboard avoids scanning (`events:url-liveness-count`)  |
+| Snapshot             | Committed JSON of sites or water facilities meant as a cold-start floor; not shipped to production today      |
+| Soft-404             | A page that returns 200 but says "not found"; detected by a body heuristic in `server/lib/urlLiveness.ts`     |
+| Stale                | Older than the logical TTL, still served                                                                      |
+| Unidentified         | Flight with no callsign (hex only)                                                                            |
+| Wave                 | One slice of a run: extract → geocode → merge into `events:llm:v3`. A run is a series of waves under a budget |
+| `WAR_START`          | 2026-02-28 UTC. Lower bound for events and the default date filter                                            |

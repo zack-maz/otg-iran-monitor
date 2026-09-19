@@ -5,10 +5,10 @@ milestone_name: Final Hardening — 🚧 IN PROGRESS
 current_phase: 47
 current_phase_name: ~100-User Load Test
 status: planning
-stopped_at: Phase 46 complete; 2026-09-17 audit + docs overhaul on branch chore/overhaul-2026-09 (unmerged)
-last_updated: '2026-09-17T00:00:00.000Z'
-last_activity: 2026-09-17
-last_activity_desc: Production/code/docs audit, outage fixes, documentation overhaul
+stopped_at: Phase 46 complete; 2026-09 audit, docs overhaul and LLM pipeline recovery merged to main (2026-09-19)
+last_updated: '2026-09-19T00:00:00.000Z'
+last_activity: 2026-09-19
+last_activity_desc: LLM pipeline recovered in production (retired NIM model replaced, checkpointed waves); docs and ADR-0012
 progress:
   total_phases: 8
   completed_phases: 6
@@ -32,11 +32,11 @@ See: .planning/PROJECT.md
 Milestone: v2.0 Final Hardening
 Phases 42–46: complete (2026-06-10 … 2026-06-22). Phase 49 (docs cleanup): delivered out of band on 2026-09-17.
 Next roadmap phase: 47 (~100-User Load Test) — not planned, not started.
-Last activity: 2026-09-17 — audit, outage fixes, docs overhaul.
+Last activity: 2026-09-19 — LLM pipeline recovered in production; before that 2026-09-17/18 — audit, outage fixes, docs overhaul.
 
-**Before planning Phase 47, read `docs/AUDIT-2026-09.md`.** Production had flights down and the LLM pipeline empty for months. The root causes are fixed on branch `chore/overhaul-2026-09`, which is not merged or deployed. The audit recommends a recovery phase ahead of the load test (see ROADMAP "Read this first").
+**Before planning Phase 47, read `docs/AUDIT-2026-09.md`.** Production had flights down and the LLM pipeline empty for months. Both are fixed and deployed: the September fixes merged 2026-09-18, the pipeline recovery (`fix/nim-model-eol`, ADR-0012) on 2026-09-19. The audit's §6 lists what is left before a load test: honest health (L2), green CI, the events read path (L9).
 
-## Branch `chore/overhaul-2026-09` (unmerged)
+## Branch `chore/overhaul-2026-09` (merged 2026-09-18)
 
 Fixes:
 
