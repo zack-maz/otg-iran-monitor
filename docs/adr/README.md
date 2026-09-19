@@ -28,6 +28,7 @@ context, decision, consequences, alternatives, references. See
 | [0009](./0009-two-key-split-for-llm-partial-progress-vs-terminal-reads.md) | Two-key split for LLM partial progress vs terminal reads    | Accepted                            |
 | [0010](./0010-v1-5-llm-pipeline-narrowing-and-deletion.md)                 | v1.5 LLM pipeline narrowing and deletion                    | Accepted                            |
 | [0011](./0011-v3-llm-pipeline-architecture.md)                             | v3 LLM pipeline architecture                                | Accepted                            |
+| [0012](./0012-checkpointed-waves-and-read-path-top-up.md)                  | Checkpointed waves, read-path top-up, probing for the model | Accepted                            |
 
 ## One-line summaries
 
@@ -84,6 +85,14 @@ a function`. Split observability (`events:llm:v2:partial`) from
   v2 production incident it was designed to prevent. Companion to
   ADR-0009 (writer/reader-shape discipline) and ADR-0010 (deletion
   context).
+- **ADR-0012 — Checkpointed waves, read-path top-up, probing for the
+  model.** The pipeline wrote nothing for months: the model was retired
+  and a cold run could not finish inside 800 s with a single write at
+  the end. Runs now persist a wave at a time under deadlines, the
+  router waits instead of skipping, `/api/events` fills the gaps with
+  raw rows, and a replacement model is found by probing production —
+  secrets are write-only. Replaces the single terminal write of
+  ADR-0009 and ADR-0011 property (3); their bodies stay as written.
 
 ## Conventions
 

@@ -13,7 +13,7 @@ Personal real-time intelligence dashboard for the Iran conflict: a 2.5D map (Map
 | How the system works, per-source gotchas, pipeline, deployment, frontend | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)                        |
 | Something is broken; operator actions; deploy checklist                  | [docs/OPERATIONS.md](docs/OPERATIONS.md)                            |
 | Every Redis key, its writer, reader and TTL                              | [docs/redis-keys.md](docs/redis-keys.md)                            |
-| Known defects, dead code, cleanup backlog (snapshot, 2026-09-17)         | [docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)                      |
+| Known defects, dead code, cleanup backlog (2026-09-17, statuses current) | [docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)                      |
 | Env vars                                                                 | [.env.example](.env.example) + the Zod schema in `server/config.ts` |
 | API contract                                                             | `server/openapi.yaml` (`npm run openapi:lint`)                      |
 | Why a decision was made                                                  | [docs/adr/](docs/adr/README.md)                                     |

@@ -16,9 +16,9 @@ Phase-by-phase history for every milestone before v2.0 (plans, research, verific
 
 ## Read this first (2026-09-17)
 
-The project sat unattended for ~12 weeks. A production + code + docs audit on 2026-09-17 found flights down, the LLM event pipeline producing nothing for months, and a set of latent defects. Findings, fixes made, and a recommended order of work are in [`docs/AUDIT-2026-09.md`](../docs/AUDIT-2026-09.md). Outage fixes and the documentation overhaul are on branch `chore/overhaul-2026-09`.
+The project sat unattended for ~12 weeks. A production + code + docs audit on 2026-09-17 found flights down, the LLM event pipeline producing nothing for months, and a set of latent defects. Findings, fixes made, and a recommended order of work are in [`docs/AUDIT-2026-09.md`](../docs/AUDIT-2026-09.md). Outage fixes and the documentation overhaul merged on 2026-09-18 (`chore/overhaul-2026-09`). On 2026-09-19 the LLM pipeline was recovered in production: NVIDIA had retired the model, and runs are now bounded, checkpointed and honest about failure (`fix/nim-model-eol`, ADR-0012).
 
-**Proposed, not yet accepted:** before Phases 47–48, insert a recovery phase covering AUDIT §6 steps 1–4 (deploy the branch; make the extraction run bounded, checkpointed and honestly reported; green CI; delete the inert pipeline machinery). Load-testing a system whose main pipeline cannot complete a cold run is the wrong order. Add it with `/gsd-phase` once agreed.
+**Proposed, not yet accepted:** before Phases 47–48, insert a recovery phase covering what is left of AUDIT §6: honest health reporting (L2), green CI, a lighter events read path (L9), and deleting the inert pipeline machinery. The deploy and the bounded, checkpointed extraction run are done. Add it with `/gsd-phase` once agreed.
 
 ## Milestone v2.0: Final Hardening — 🚧 IN PROGRESS (started 2026-06-09)
 
