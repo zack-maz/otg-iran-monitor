@@ -36,9 +36,9 @@ vi.mock('../../lib/freeClaudeRouter.js', () => ({
   callLLM: vi.fn().mockResolvedValue({ content: null, routing: [] }),
 }));
 
-import { callLLM } from '../../lib/freeClaudeRouter.js';
 import { forwardGeocodeConstrained } from '../../adapters/nominatim.js';
 import { cacheGetSafe, cacheSetSafe } from '../../cache/redis.js';
+import { callLLM } from '../../lib/freeClaudeRouter.js';
 import {
   resolveLocation,
   fuzzyNameMatch,
@@ -464,6 +464,56 @@ describe('Phase 27.4 Plan 05 - POI amenity path (D-03)', () => {
 
     expect(elapsed).toBeGreaterThanOrEqual(900);
   }, 10_000);
+
+  // The geocoder resolves four events at a time. A throttle that reads "time
+  // of the last call" and then sleeps lets every concurrent caller read the
+  // same timestamp and fire together; each caller must reserve its own slot
+  // before it waits.
+  it('spaces concurrent resolves a second apart instead of letting them fire together', async () => {
+    vi.useFakeTimers();
+    try {
+      const t0 = Date.UTC(2026, 8, 19, 4, 0, 0);
+      vi.setSystemTime(t0);
+      const hitAtMs: number[] = [];
+      vi.mocked(forwardGeocodeConstrained).mockImplementation(async () => {
+        hitAtMs.push(Date.now() - t0);
+        return [
+          {
+            lat: 33.72,
+            lng: 51.73,
+            displayName: 'Site',
+            type: 'nuclear',
+            address: { country_code: 'ir' },
+          },
+        ];
+      });
+      const c = ctx({ centroidLat: 33.7, centroidLng: 51.7 });
+
+      const all = Promise.all([
+        resolveLocation(hierarchy({ country: 'Iran', landmark: 'Natanz nuclear facility' }), c),
+        resolveLocation(hierarchy({ country: 'Iran', landmark: 'Bushehr nuclear power plant' }), c),
+        resolveLocation(hierarchy({ country: 'Iran', landmark: 'Fordow nuclear site' }), c),
+      ]);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hitAtMs).toEqual([0]);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(hitAtMs).toEqual([0]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(hitAtMs).toEqual([0, 1000]);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(hitAtMs).toEqual([0, 1000, 2000]);
+
+      const out = await all;
+      expect(out.map((r) => r.provenance)).toEqual([
+        'poi-amenity-nominatim',
+        'poi-amenity-nominatim',
+        'poi-amenity-nominatim',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('negative-caches misses so repeated misses do not re-hit Nominatim', async () => {
     vi.mocked(forwardGeocodeConstrained).mockResolvedValue([]);

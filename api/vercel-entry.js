@@ -14,6 +14,7 @@ __export(redis_exports, {
   cacheGet: () => cacheGet,
   cacheGetSafe: () => cacheGetSafe,
   cacheSet: () => cacheSet,
+  cacheSetReported: () => cacheSetReported,
   cacheSetSafe: () => cacheSetSafe,
   redis: () => redis
 });
@@ -106,6 +107,19 @@ async function cacheGetSafe(key, logicalTtlMs) {
     return null;
   }
 }
+async function cacheSetReported(key, data, redisTtlSec) {
+  memCache.set(key, { data, fetchedAt: Date.now() });
+  try {
+    await withTimeout(
+      cacheSet(key, data, redisTtlSec),
+      REDIS_BULK_WRITE_TIMEOUT_MS,
+      `cacheSet(${key})`
+    );
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
 async function cacheSetSafe(key, data, redisTtlSec) {
   memCache.set(key, { data, fetchedAt: Date.now() });
   try {
@@ -113,7 +127,7 @@ async function cacheSetSafe(key, data, redisTtlSec) {
   } catch {
   }
 }
-var NON_KEY_METHODS, VARIADIC_KEY_METHODS, SCAN_METHODS, EVAL_METHODS, redis, memCache, REDIS_OP_TIMEOUT_MS;
+var NON_KEY_METHODS, VARIADIC_KEY_METHODS, SCAN_METHODS, EVAL_METHODS, redis, memCache, REDIS_OP_TIMEOUT_MS, REDIS_BULK_WRITE_TIMEOUT_MS;
 var init_redis = __esm({
   "server/cache/redis.ts"() {
     "use strict";
@@ -138,6 +152,7 @@ var init_redis = __esm({
     );
     memCache = /* @__PURE__ */ new Map();
     REDIS_OP_TIMEOUT_MS = 2e3;
+    REDIS_BULK_WRITE_TIMEOUT_MS = 2e4;
   }
 });
 
@@ -496,11 +511,13 @@ var envSchema = z.object({
   // Tuning knob:
   //   - LLM_V3_CONCURRENCY=1 reverts to fully sequential (rollback path)
   //   - LLM_V3_CONCURRENCY=20 saturates NIM but risks 429s mid-run
-  //   - default=12 balances throughput against rate-limit safety
+  //   - default=8: gemma-4-31b-it answers a 2-group batch in ~15 s, so 8 in
+  //     flight is ~32 requests/min — just under NIM's 40/min free-tier cap.
+  //     (12 was sized for the retired qwen model at ~27 s per batch.)
   //
   // The setting only affects the per-batch fan-out; resolver geocoding is
   // still serialized at 1 req/s for Nominatim regardless of this value.
-  LLM_V3_CONCURRENCY: z.coerce.number().int().positive().default(12),
+  LLM_V3_CONCURRENCY: z.coerce.number().int().positive().default(8),
   // Phase 30 D-07 (LLM-RELI-03) — promoted from the hard-coded
   // `const BATCH_SIZE = 2` at server/lib/llmEventExtractor.v3.ts (D-10
   // rationale: each group already carries news + Bellingcat + temporal
@@ -1179,7 +1196,8 @@ function groupGdeltRows(entities) {
     }
     if (!matched) {
       groups.push({
-        key: `grp-${entityDay}-${entityRoot}-${groups.length}`,
+        key: "",
+        // assigned below, once membership is final
         entities: [entity],
         centroidLat: entity.lat,
         centroidLng: entity.lng,
@@ -1191,7 +1209,42 @@ function groupGdeltRows(entities) {
       });
     }
   }
+  for (const group of groups) {
+    const day = dayBucket(group.timestamp);
+    const root = cameoRoot(group.primaryCameo);
+    group.key = `grp-${day}-${root}-${lowestEntityId(group.entities)}`;
+  }
   return groups;
+}
+function lowestEntityId(entities) {
+  let best = "";
+  let bestNum = Number.POSITIVE_INFINITY;
+  for (const e of entities) {
+    const bare = e.id.replace(/^gdelt-/, "");
+    const num = Number(bare);
+    if (Number.isFinite(num)) {
+      if (num < bestNum) {
+        bestNum = num;
+        best = bare;
+      }
+    } else if (bestNum === Number.POSITIVE_INFINITY && (best === "" || bare < best)) {
+      best = bare;
+    }
+  }
+  return best;
+}
+function enrichedIdForGroup(groupKey) {
+  return `llm-v3-${groupKey}`;
+}
+function fillWithRawEvents(enriched, raw) {
+  if (raw.length === 0) return enriched;
+  if (enriched.length === 0) return raw;
+  const enrichedIds = new Set(enriched.map((e) => e.id));
+  const uncovered = [];
+  for (const group of groupGdeltRows(dedupHighConfidence(raw))) {
+    if (!enrichedIds.has(enrichedIdForGroup(group.key))) uncovered.push(...group.entities);
+  }
+  return [...enriched, ...uncovered];
 }
 
 // server/lib/llmDLQ.ts
@@ -1971,11 +2024,12 @@ function isAvailable(provider) {
 // server/lib/freeClaudeRouter.ts
 var NVIDIA_NIM_BASE = "https://integrate.api.nvidia.com/v1";
 var OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-var LLM_TIMEOUT_MS = 12e4;
+var LLM_TIMEOUT_MS = 9e4;
+var FATAL_STATUSES = /* @__PURE__ */ new Set([401, 403, 404, 410]);
 var RETRY_ATTEMPTS = 3;
 var BACKOFF_MS = [2e3, 8e3, 32e3];
 var JITTER_MS = 500;
-var NVIDIA_NIM_DEFAULT_MODEL = process.env.V3_PRIMARY_MODEL ?? "qwen/qwen3.5-397b-a17b";
+var NVIDIA_NIM_DEFAULT_MODEL = process.env.V3_PRIMARY_MODEL ?? "google/gemma-4-31b-it";
 var OPENROUTER_DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
 var OPENROUTER_DAILY_CAP = 200;
 var MAX_TOKENS_PER_MODEL = {
@@ -1983,13 +2037,8 @@ var MAX_TOKENS_PER_MODEL = {
   // showed ~89% truncation rate (50 v3:malformed DLQ in 7 batches) — the
   // 20-event preflight characterization underestimated production hierarchy
   // verbosity. 2048 keeps a 5× safety margin against the 4096 default.
-  "qwen/qwen3.5-397b-a17b": 2048,
-  "meta/llama-3.3-70b-instruct": 380,
-  // p99 315 + 20% buffer
-  "nvidia/nemotron-3-super-120b-a12b": 1240,
-  // p99 1031 + 20% buffer (verbose, schema-fails)
-  "z-ai/glm4.7": 1024
-  // conservative — no traceable records (NIM 400s)
+  // ~590 tokens observed per 2-group batch; 2048 leaves room for LLM_BATCH_SIZE up to ~6.
+  "google/gemma-4-31b-it": 2048
 };
 var MAX_TOKENS_DEFAULT = 4096;
 var RollingWindow = class {
@@ -2010,6 +2059,24 @@ var RollingWindow = class {
   consume() {
     this.timestamps.push(Date.now());
   }
+  /**
+   * Wait for a free slot, then take it. Callers block instead of being turned
+   * away: with a single provider there is nowhere to fall through to, so a
+   * refused call is a lost batch, and a full window used to drain the rest of
+   * a run as instant nulls.
+   */
+  async acquire() {
+    for (; ; ) {
+      const now = Date.now();
+      this.evict(now);
+      if (this.timestamps.length < this.cap) {
+        this.timestamps.push(now);
+        return;
+      }
+      const oldest = this.timestamps[0] ?? now;
+      await new Promise((r) => setTimeout(r, Math.max(50, oldest + this.windowMs - now)));
+    }
+  }
   headroom() {
     this.evict(Date.now());
     return { used: this.timestamps.length, cap: this.cap };
@@ -2023,7 +2090,11 @@ function getNvidiaNimClient() {
   return new OpenAI({
     apiKey: env.NVIDIA_NIM_API_KEY,
     baseURL: NVIDIA_NIM_BASE,
-    timeout: LLM_TIMEOUT_MS
+    timeout: LLM_TIMEOUT_MS,
+    // The router owns retries. The SDK's default 2 hidden retries tripled the
+    // real request rate behind the 40/min window and stretched a failing call
+    // past the batch watchdog.
+    maxRetries: 0
   });
 }
 function getOpenRouterClient() {
@@ -2031,7 +2102,8 @@ function getOpenRouterClient() {
   return new OpenAI({
     apiKey: env.OPENROUTER_API_KEY,
     baseURL: OPENROUTER_BASE,
-    timeout: LLM_TIMEOUT_MS
+    timeout: LLM_TIMEOUT_MS,
+    maxRetries: 0
   });
 }
 function stripReasoningBlocks(raw, _reasoningContent) {
@@ -2062,7 +2134,7 @@ function todayKey() {
   ).padStart(2, "0")}`;
 }
 async function callLLM(messages, _schemaText, opts = {}) {
-  const log43 = logger.child({ component: "freeClaudeRouter" });
+  const log44 = logger.child({ component: "freeClaudeRouter" });
   const decisions = [];
   const includeOpenRouter = !opts.skipOpenRouter;
   const allProviders = [
@@ -2078,6 +2150,8 @@ async function callLLM(messages, _schemaText, opts = {}) {
     }
   ];
   const providers = includeOpenRouter ? allProviders : allProviders.filter((p) => p.name !== "openrouter");
+  const hasFallThrough = providers.filter((p) => p.client).length > 1;
+  let fatalStatus;
   for (let idx = 0; idx < providers.length; idx++) {
     const p = providers[idx];
     if (!p) continue;
@@ -2093,20 +2167,11 @@ async function callLLM(messages, _schemaText, opts = {}) {
       });
       continue;
     }
-    if (!isAvailable(p.name)) {
+    if (hasFallThrough && !isAvailable(p.name)) {
       decisions.push({
         provider: p.name,
         model: p.model,
         reason: buildReason("breaker"),
-        timestamp: Date.now()
-      });
-      continue;
-    }
-    if (p.name === "nvidia_nim" && !nvidiaNimWindow.canRequest()) {
-      decisions.push({
-        provider: p.name,
-        model: p.model,
-        reason: buildReason("rate_limit_window"),
         timestamp: Date.now()
       });
       continue;
@@ -2119,9 +2184,10 @@ async function callLLM(messages, _schemaText, opts = {}) {
     });
     let callFailed = false;
     for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-      const t0 = Date.now();
+      let t0 = Date.now();
       try {
-        if (p.name === "nvidia_nim") nvidiaNimWindow.consume();
+        if (p.name === "nvidia_nim") await nvidiaNimWindow.acquire();
+        t0 = Date.now();
         const res = await p.client.chat.completions.create({
           model: p.model,
           messages,
@@ -2194,7 +2260,7 @@ async function callLLM(messages, _schemaText, opts = {}) {
           callHistory: [failureEntry, ...history].slice(0, 20)
         });
         void appendCallHistory(failureEntry);
-        log43.warn(
+        log44.warn(
           {
             provider: p.name,
             attempt,
@@ -2205,6 +2271,8 @@ async function callLLM(messages, _schemaText, opts = {}) {
           },
           "router attempt failed"
         );
+        const status = err.status;
+        if (typeof status === "number" && FATAL_STATUSES.has(status)) fatalStatus = status;
         if (bucket === "rate_limit" && attempt < RETRY_ATTEMPTS - 1) {
           const base = BACKOFF_MS[attempt] ?? BACKOFF_MS[0] ?? 1e3;
           await sleepWithJitter(base);
@@ -2218,8 +2286,8 @@ async function callLLM(messages, _schemaText, opts = {}) {
       record(p.name, "err");
     }
   }
-  log43.warn("all free providers unavailable \u2014 returning null content");
-  return { content: null, routing: decisions };
+  log44.warn({ fatalStatus }, "all free providers unavailable \u2014 returning null content");
+  return { content: null, routing: decisions, fatalStatus };
 }
 var LATENCY_RING_CAP = 100;
 function quantile(sorted, q) {
@@ -2292,7 +2360,7 @@ async function accrueShadowCost(tokensIn, tokensOut) {
   }
 }
 async function prewarmIfCold() {
-  const log43 = logger.child({ component: "freeClaudeRouter.prewarmIfCold" });
+  const log44 = logger.child({ component: "freeClaudeRouter.prewarmIfCold" });
   const client = getNvidiaNimClient();
   if (!client) {
     updateProgress({ prewarmState: "unknown" });
@@ -2318,7 +2386,7 @@ async function prewarmIfCold() {
       prewarmState: "cold-fired"
     });
   } catch (err) {
-    log43.warn(
+    log44.warn(
       { err: err instanceof Error ? err.message : String(err) },
       "prewarmIfCold synthetic call failed (non-fatal)"
     );
@@ -2384,7 +2452,7 @@ function computeLineageHash(eventId, prompt, model) {
 async function appendLineage(eventId, payload) {
   const lineageHash = computeLineageHash(eventId, payload.prompt, payload.model);
   const key = `${LINEAGE_KEY_PREFIX}${eventId}`;
-  const log43 = logger.child({ component: "llm-lineage" });
+  const log44 = logger.child({ component: "llm-lineage" });
   try {
     await redis.hset(key, {
       prompt: payload.prompt.slice(0, 32e3),
@@ -2404,7 +2472,7 @@ async function appendLineage(eventId, payload) {
     await redis.zremrangebyrank(LINEAGE_INDEX_KEY, 0, -LINEAGE_MAX_ENTRIES - 1);
     await redis.expire(LINEAGE_INDEX_KEY, LINEAGE_TTL_SEC);
   } catch (err) {
-    log43.warn({ err, eventId }, "lineage append failed (redis unreachable)");
+    log44.warn({ err, eventId }, "lineage append failed (redis unreachable)");
   }
   return { lineageHash };
 }
@@ -2816,13 +2884,12 @@ var GEOCODE_CACHE_PREFIX = "geocode:fwd:constrained:v2:";
 var GEOCODE_CACHE_LOGICAL_TTL_MS = 30 * 24 * 3600 * 1e3;
 var GEOCODE_CACHE_REDIS_TTL_SEC = 30 * 24 * 3600;
 var GEOCODE_DELAY_MS = 1e3;
-var lastNominatimCallMs = 0;
+var nextNominatimSlotMs = 0;
 async function throttleNominatim() {
-  const elapsed = Date.now() - lastNominatimCallMs;
-  if (elapsed < GEOCODE_DELAY_MS) {
-    await new Promise((resolve4) => setTimeout(resolve4, GEOCODE_DELAY_MS - elapsed));
-  }
-  lastNominatimCallMs = Date.now();
+  const now = Date.now();
+  const slot = Math.max(now, nextNominatimSlotMs);
+  nextNominatimSlotMs = slot + GEOCODE_DELAY_MS;
+  if (slot > now) await new Promise((resolve4) => setTimeout(resolve4, slot - now));
 }
 function cacheKey(kind, parts) {
   const ordered = Object.keys(parts).sort().filter((k) => parts[k] !== void 0).map((k) => `${k}=${parts[k]}`).join("|");
@@ -3232,6 +3299,7 @@ async function resolveLocation(hierarchy, ctx) {
 // server/lib/llmEventExtractor.v3.ts
 var log10 = logger.child({ module: "llm-extractor-v3" });
 var BATCH_SIZE = env.LLM_BATCH_SIZE;
+var GEOCODE_CONCURRENCY = 4;
 var V3_BAKEOFF_MODEL = process.env.V3_BAKEOFF_MODEL;
 var TEMPORAL_CONTEXT_COUNT = 3;
 var TEMPORAL_CONTEXT_BBOX_DEG = 1;
@@ -3412,6 +3480,7 @@ async function processEventGroupsV3(groups, onBatchComplete) {
   await prewarmIfCold();
   const results = [];
   let allFailed = true;
+  let fatalStatus;
   let groupsToProcess = groups;
   if (env.V3_LINEAGE_PREFILTER) {
     const stats = llmProgress.lineagePrefilterStats ?? { hitCount: 0, missCount: 0 };
@@ -3479,6 +3548,11 @@ async function processEventGroupsV3(groups, onBatchComplete) {
     const batchIndex = Math.floor(i / BATCH_SIZE);
     tasks.push(
       limit(async () => {
+        if (fatalStatus !== void 0) {
+          recordFailedBatch();
+          await finishBatch();
+          return;
+        }
         const contexts = await Promise.all(batch.map(buildPromptContext));
         for (const ctx of contexts) {
           matchedNewsByGroup.set(ctx.group.key, ctx.matchedNews);
@@ -3519,6 +3593,13 @@ async function processEventGroupsV3(groups, onBatchComplete) {
               }
             );
             routing = result.routing;
+            if (result.fatalStatus !== void 0 && fatalStatus === void 0) {
+              fatalStatus = result.fatalStatus;
+              log10.error(
+                { status: fatalStatus, batchIndex },
+                "v3 provider rejected the call permanently \u2014 skipping the remaining batches"
+              );
+            }
             finishReason = result.finishReason ?? null;
             return result.content;
           },
@@ -3699,7 +3780,8 @@ ${userPrompt}`;
   return {
     events: allFailed ? null : results,
     matchedNewsByGroup,
-    bellingcatByGroup
+    bellingcatByGroup,
+    fatalStatus
   };
 }
 async function splitBatchOnTimeout(contexts, batchIndex) {
@@ -3794,11 +3876,12 @@ async function splitBatchOnTimeout(contexts, batchIndex) {
   }
   return successes;
 }
-async function geocodeEnrichedEventsV3(events, groupsByKey, matchedNewsByGroup, bellingcatByGroup, onComplete) {
-  const out = [];
-  for (let i = 0; i < events.length; i++) {
-    const ev = events[i];
-    if (!ev) continue;
+async function geocodeEnrichedEventsV3(events, groupsByKey, matchedNewsByGroup, bellingcatByGroup, onComplete, opts = {}) {
+  const limit = createLimit(GEOCODE_CONCURRENCY);
+  const slots = new Array(events.length);
+  let completed = 0;
+  const geocodeOne = async (ev, i) => {
+    if (opts.deadlineMs !== void 0 && Date.now() >= opts.deadlineMs) return;
     const group = groupsByKey.get(ev.groupKey);
     const matchedNews = matchedNewsByGroup.get(ev.groupKey) ?? [];
     const ctx = {
@@ -3843,7 +3926,7 @@ async function geocodeEnrichedEventsV3(events, groupsByKey, matchedNewsByGroup, 
       actionGeoDistanceKm: resolved.actionGeoDistanceKm,
       tiers
     });
-    out.push({
+    slots[i] = {
       ...ev,
       resolvedLat: resolved.lat,
       resolvedLng: resolved.lng,
@@ -3852,10 +3935,11 @@ async function geocodeEnrichedEventsV3(events, groupsByKey, matchedNewsByGroup, 
       suspect,
       actionGeoDistanceKm: resolved.actionGeoDistanceKm,
       displayName: resolved.displayName
-    });
-    onComplete?.(i + 1, events.length);
-  }
-  return out;
+    };
+    onComplete?.(++completed, events.length);
+  };
+  await Promise.all(events.map((ev, i) => limit(() => geocodeOne(ev, i))));
+  return slots.filter((e) => e !== void 0);
 }
 
 // server/lib/llmRunHistory.ts
@@ -5293,6 +5377,15 @@ var LLM_REDIS_TTL_SEC = 9e3;
 var LLM_TERMINAL_TTL_SEC = 172800;
 var LLM_SUMMARY_TTL_SEC = 86400;
 var BATCH_SIZE_ACTIVE = 2;
+var LLM_PHASE_BUDGET_MS = 48e4;
+var GEOCODE_PHASE_BUDGET_MS = 66e4;
+var EVAL_START_BUDGET_MS = 54e4;
+function describeFatalStatus(status) {
+  if (status === 410)
+    return "the model has been retired; probe a replacement (/api/cron/llm-probe)";
+  if (status === 404) return "the model is not served to this key; probe a replacement";
+  return "the NIM API key was rejected";
+}
 async function mergeAndPersistLlmEntities(newlyEnriched, llmCachedRef, key) {
   const llmMergeMap = /* @__PURE__ */ new Map();
   if (llmCachedRef?.data) {
@@ -5300,13 +5393,15 @@ async function mergeAndPersistLlmEntities(newlyEnriched, llmCachedRef, key) {
   }
   for (const e of newlyEnriched) llmMergeMap.set(e.id, e);
   const llmMerged = Array.from(llmMergeMap.values());
-  await cacheSetSafe(key, llmMerged, LLM_TERMINAL_TTL_SEC);
+  const written = await cacheSetReported(key, llmMerged, LLM_TERMINAL_TTL_SEC);
   saveDevLLMCacheV2(llmMerged);
-  log18.info(
-    { count: newlyEnriched.length, total: llmMerged.length },
-    "LLM: persisted enriched events to terminal cache (Plan 01 helper)"
-  );
-  return { writtenCount: newlyEnriched.length, total: llmMerged.length };
+  const counts = { writtenCount: newlyEnriched.length, total: llmMerged.length };
+  if (!written.ok) {
+    log18.error({ ...counts, err: written.error }, "LLM: write to the enriched cache FAILED");
+    return { ...counts, merged: llmMerged, ok: false, error: written.error };
+  }
+  log18.info(counts, "LLM: persisted enriched events");
+  return { ...counts, merged: llmMerged, ok: true };
 }
 async function runRefreshExtraction(opts) {
   const cronStart = Date.now();
@@ -5409,7 +5504,7 @@ async function runRefreshExtraction(opts) {
             if (e.id) cachedLlmKeys.add(e.id);
           }
         }
-        const newGroups = cachedLlmKeys.size > 0 ? groups.filter((g) => !cachedLlmKeys.has(`llm-v3-${g.key}`)) : groups;
+        const newGroups = cachedLlmKeys.size > 0 ? groups.filter((g) => !cachedLlmKeys.has(enrichedIdForGroup(g.key))) : groups;
         updateProgress({ newGroups: newGroups.length });
         if (newGroups.length === 0) {
           log18.info("LLM: no new groups to process");
@@ -5441,23 +5536,118 @@ async function runRefreshExtraction(opts) {
           return;
         }
         const prioritizedGroups = await prioritizeBySeverity(newGroups);
-        const effectiveBatchSize = BATCH_SIZE_ACTIVE;
-        updateProgress({
-          stage: "llm-processing",
-          totalBatches: Math.ceil(prioritizedGroups.length / effectiveBatchSize)
-        });
-        const extractResult = await processEventGroupsV3(
-          prioritizedGroups,
-          async (completed, total) => {
-            updateProgress({ completedBatches: completed, totalBatches: total });
-          }
+        const waveSize = Math.max(
+          BATCH_SIZE_ACTIVE,
+          env.LLM_V3_CONCURRENCY * BATCH_SIZE_ACTIVE * 2
         );
-        if (!extractResult.events || extractResult.events.length === 0) {
-          log18.warn("LLM processing returned null \u2014 raw GDELT serving continues");
+        const llmDeadlineMs = cronStart + LLM_PHASE_BUDGET_MS;
+        const geocodeDeadlineMs = cronStart + GEOCODE_PHASE_BUDGET_MS;
+        const totalBatchesAll = Math.ceil(prioritizedGroups.length / BATCH_SIZE_ACTIVE);
+        updateProgress({ stage: "llm-processing", totalBatches: totalBatchesAll });
+        let cacheRef = llmCachedRef;
+        let batchesDone = 0;
+        let enrichedTotal = 0;
+        let geocodedTotal = 0;
+        let persistedTotal = 0;
+        let writeError = null;
+        let extractError = null;
+        let fatalStatus;
+        const provenanceCounts = {};
+        let suspectCount = 0;
+        let newsClusters;
+        try {
+          const newsCache = await cacheGetSafe("news:feed", 0);
+          if (newsCache?.data) newsClusters = newsCache.data;
+        } catch {
+        }
+        const geocodeAndPersist = async (wave, extract) => {
+          const events = extract.events ?? [];
+          if (events.length === 0) return;
+          const groupsByKey = new Map(wave.map((g) => [g.key, g]));
+          const geocoded = await geocodeEnrichedEventsV3(
+            events,
+            groupsByKey,
+            extract.matchedNewsByGroup,
+            extract.bellingcatByGroup,
+            (completed) => {
+              updateProgress({ completedGeocodes: geocodedTotal + completed });
+            },
+            { deadlineMs: geocodeDeadlineMs }
+          );
+          geocodedTotal += geocoded.length;
+          for (const e of geocoded) {
+            provenanceCounts[e.geocodeProvenance] = (provenanceCounts[e.geocodeProvenance] ?? 0) + 1;
+            if (e.suspect) suspectCount++;
+          }
+          updateProgress({ provenanceCounts, suspectCount, completedGeocodes: geocodedTotal });
+          if (geocoded.length === 0) return;
+          const entities = enrichedV3ToEntities(geocoded, wave, newsClusters);
+          const written = await mergeAndPersistLlmEntities(
+            entities,
+            cacheRef,
+            LLM_EVENTS_KEY_ACTIVE
+          );
+          cacheRef = { data: written.merged };
+          if (written.ok) persistedTotal += written.writtenCount;
+          else writeError = written.error;
+        };
+        const geocodeAndPersistSafe = async (wave, extract) => {
+          try {
+            await geocodeAndPersist(wave, extract);
+          } catch (err) {
+            writeError = err instanceof Error ? err.message : String(err);
+            log18.error({ err: writeError }, "LLM: geocode/persist failed for a wave");
+          }
+        };
+        let geocodeChain = Promise.resolve();
+        for (let i = 0; i < prioritizedGroups.length; i += waveSize) {
+          if (Date.now() >= llmDeadlineMs) {
+            log18.info(
+              { processedGroups: i, totalGroups: prioritizedGroups.length },
+              "LLM: phase budget spent \u2014 remaining groups are left for the next run"
+            );
+            break;
+          }
+          const wave = prioritizedGroups.slice(i, i + waveSize);
+          const doneBefore = batchesDone;
+          let extract;
+          try {
+            extract = await processEventGroupsV3(wave, (completed) => {
+              updateProgress({
+                completedBatches: doneBefore + completed,
+                totalBatches: totalBatchesAll
+              });
+            });
+          } catch (waveErr) {
+            extractError = waveErr instanceof Error ? waveErr.message : String(waveErr);
+            log18.error(
+              { err: extractError, wave: i / waveSize },
+              "LLM: a wave threw \u2014 ending the run"
+            );
+            break;
+          }
+          batchesDone += Math.ceil(wave.length / BATCH_SIZE_ACTIVE);
+          enrichedTotal += extract.events?.length ?? 0;
+          updateProgress({ enrichedCount: enrichedTotal, totalGeocodes: enrichedTotal });
+          await geocodeChain;
+          geocodeChain = geocodeAndPersistSafe(wave, extract);
+          if (extract.fatalStatus !== void 0) {
+            fatalStatus = extract.fatalStatus;
+            break;
+          }
+        }
+        updateProgress({ stage: "geocoding" });
+        await geocodeChain;
+        if (fatalStatus !== void 0 || persistedTotal === 0) {
+          const errorMessage = fatalStatus !== void 0 ? `LLM provider answered HTTP ${fatalStatus} \u2014 ${describeFatalStatus(fatalStatus)}` : writeError ?? extractError ?? "LLM returned null for all batches";
+          log18.warn(
+            { fatalStatus, writeError, enrichedTotal, persistedTotal },
+            "LLM run produced nothing new \u2014 raw GDELT serving continues"
+          );
           runOutcome = "error";
           updateProgress({
             stage: "error",
-            errorMessage: "LLM returned null for all batches",
+            errorMessage,
             completedAt: Date.now(),
             durationMs: Date.now() - (llmProgress.startedAt ?? Date.now())
           });
@@ -5467,46 +5657,23 @@ async function runRefreshExtraction(opts) {
           }
           return;
         }
-        updateProgress({
-          stage: "geocoding",
-          enrichedCount: extractResult.events.length,
-          totalGeocodes: extractResult.events.length
-        });
-        const groupsByKey = new Map(prioritizedGroups.map((g) => [g.key, g]));
-        const geocodedEvents = await geocodeEnrichedEventsV3(
-          extractResult.events,
-          groupsByKey,
-          extractResult.matchedNewsByGroup,
-          extractResult.bellingcatByGroup,
-          (completed, total) => {
-            updateProgress({ completedGeocodes: completed, totalGeocodes: total });
+        if (Date.now() < cronStart + EVAL_START_BUDGET_MS) {
+          try {
+            const evalScore = await runEval();
+            updateProgress({ evalScore });
+            log18.info({ evalScore, schemaVersion: "v3" }, "eval harness completed");
+          } catch (evalErr) {
+            log18.warn({ err: evalErr }, "eval harness threw; continuing pipeline");
           }
-        );
-        const provenanceCounts = {};
-        let suspectCount = 0;
-        for (const e of geocodedEvents) {
-          provenanceCounts[e.geocodeProvenance] = (provenanceCounts[e.geocodeProvenance] ?? 0) + 1;
-          if (e.suspect) suspectCount++;
         }
-        updateProgress({ provenanceCounts, suspectCount });
-        try {
-          const evalScore = await runEval();
-          updateProgress({ evalScore });
-          log18.info({ evalScore, schemaVersion: "v3" }, "eval harness completed");
-        } catch (evalErr) {
-          log18.warn({ err: evalErr }, "eval harness threw; continuing pipeline");
-        }
-        let newsClusters;
-        try {
-          const newsCache = await cacheGetSafe("news:feed", 0);
-          if (newsCache?.data) newsClusters = newsCache.data;
-        } catch {
-        }
-        const llmEntities = enrichedV3ToEntities(geocodedEvents, prioritizedGroups, newsClusters);
-        await mergeAndPersistLlmEntities(llmEntities, llmCachedRef, LLM_EVENTS_KEY_ACTIVE);
         runOutcome = "completed";
+        const partialFailure = writeError ?? extractError;
+        if (partialFailure) {
+          log18.warn({ partialFailure, persistedTotal }, "LLM run completed with a lost wave");
+        }
         updateProgress({
           stage: "done",
+          ...partialFailure ? { errorMessage: `partial: ${partialFailure}` } : {},
           completedAt: Date.now(),
           durationMs: Date.now() - (llmProgress.startedAt ?? Date.now())
         });
@@ -5601,7 +5768,7 @@ function enrichedV3ToEntities(geocoded, groups, newsClusters) {
     });
     results.push({
       ...template,
-      id: `llm-v3-${enriched.groupKey}`,
+      id: enrichedIdForGroup(enriched.groupKey),
       lat: enriched.resolvedLat,
       lng: enriched.resolvedLng,
       type: enriched.type,
@@ -84490,7 +84657,13 @@ eventsRouter.get("/", validateQuery(eventsQuerySchema), async (_req, res) => {
   );
   if (llmCached) llmCached = coerceCachedEvents(llmCached);
   if (llmCached && !llmCached.stale) {
-    return sendNormalizedEvents(res, llmCached);
+    const rawForFill = forceBackfill ? null : await cacheGetSafe(EVENTS_KEY, LOGICAL_TTL_MS);
+    if (rawForFill && !rawForFill.stale) {
+      return sendNormalizedEvents(res, {
+        ...llmCached,
+        data: fillWithRawEvents(llmCached.data, rawForFill.data)
+      });
+    }
   }
   if (!llmCached?.data) {
     const devData = loadDevLLMCacheV2();
@@ -84520,8 +84693,8 @@ eventsRouter.get("/", validateQuery(eventsQuerySchema), async (_req, res) => {
   if (cached && !cached.stale) {
     if (llmCached?.data) {
       return sendNormalizedEvents(res, {
-        data: llmCached.data,
-        stale: true,
+        data: fillWithRawEvents(llmCached.data, cached.data),
+        stale: llmCached.stale,
         lastFresh: llmCached.lastFresh
       });
     }
@@ -84531,8 +84704,8 @@ eventsRouter.get("/", validateQuery(eventsQuerySchema), async (_req, res) => {
     const merged = await refreshRawEvents({ cached, forceBackfill });
     if (llmCached?.data) {
       return sendNormalizedEvents(res, {
-        data: llmCached.data,
-        stale: true,
+        data: fillWithRawEvents(llmCached.data, merged),
+        stale: llmCached.stale,
         lastFresh: llmCached.lastFresh
       });
     }
@@ -84546,9 +84719,15 @@ eventsRouter.get("/", validateQuery(eventsQuerySchema), async (_req, res) => {
     if (cached) {
       const pruned = cached.data.filter((e) => e.timestamp >= WAR_START);
       sendNormalizedEvents(res, {
-        data: pruned,
+        data: llmCached?.data ? fillWithRawEvents(llmCached.data, pruned) : pruned,
         stale: true,
         lastFresh: cached.lastFresh
+      });
+    } else if (llmCached?.data) {
+      sendNormalizedEvents(res, {
+        data: llmCached.data,
+        stale: true,
+        lastFresh: llmCached.lastFresh
       });
     } else {
       throw new AppError(502, "UPSTREAM_FAIL", `gdelt fetch failed: ${err.message}`);
@@ -85241,12 +85420,114 @@ healthRouter.get("/", async (_req, res) => {
   res.json(response);
 });
 
-// server/routes/markets.ts
+// server/routes/llm-probe-cron.ts
+init_redis();
+import { timingSafeEqual as timingSafeEqual4 } from "crypto";
 import { Router as Router10 } from "express";
+import OpenAI2 from "openai";
+var log32 = logger.child({ module: "llm-probe-cron" });
+var PROBE_TIMEOUT_MS3 = 9e4;
+var PROBE_MAX_MODELS = 8;
+var PROBE_MAX_TOKENS = 2048;
+var PROBE_GROUPS = 2;
+var llmProbeCronRouter = Router10();
+async function probeModel(client, model, userPrompt) {
+  const t0 = Date.now();
+  const result = {
+    model,
+    ok: false,
+    status: null,
+    latencyMs: 0,
+    finishReason: null,
+    tokensOut: null,
+    jsonParsed: false,
+    schemaValid: false,
+    eventCount: 0,
+    error: null
+  };
+  try {
+    const res = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT_V3 },
+        { role: "user", content: userPrompt }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0,
+      max_tokens: PROBE_MAX_TOKENS
+    });
+    result.status = 200;
+    const choice = res.choices[0];
+    result.finishReason = choice?.finish_reason ?? null;
+    result.tokensOut = res.usage?.completion_tokens ?? null;
+    const reasoning = choice?.message?.reasoning_content;
+    const content = stripReasoningBlocks(choice?.message?.content ?? null, reasoning);
+    if (content) {
+      try {
+        const parsed = JSON.parse(content);
+        result.jsonParsed = true;
+        const checked = batchResponseV3.safeParse(parsed);
+        result.schemaValid = checked.success;
+        if (checked.success) result.eventCount = checked.data.events.length;
+        else result.error = checked.error.issues[0]?.message ?? "schema_invalid";
+      } catch {
+        result.error = `json_parse_failed: ${content.slice(0, 120)}`;
+      }
+    } else {
+      result.error = "empty_content";
+    }
+    result.ok = result.schemaValid;
+  } catch (err) {
+    result.status = err.status ?? null;
+    result.error = (err instanceof Error ? err.message : String(err)).slice(0, 240);
+  }
+  result.latencyMs = Date.now() - t0;
+  return result;
+}
+llmProbeCronRouter.get("/", async (req, res) => {
+  if (env.CRON_SECRET) {
+    const auth = req.header("Authorization") ?? req.header("authorization") ?? "";
+    const expected = `Bearer ${env.CRON_SECRET}`;
+    const a = Buffer.from(auth);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !timingSafeEqual4(a, b)) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+  }
+  if (!env.NVIDIA_NIM_API_KEY) {
+    res.status(200).json({ ok: false, reason: "llm_unconfigured" });
+    return;
+  }
+  const modelsParam = typeof req.query.models === "string" ? req.query.models : "";
+  const requested = modelsParam.split(",").map((m) => m.trim()).filter(Boolean).slice(0, PROBE_MAX_MODELS);
+  const models = requested.length > 0 ? requested : [NVIDIA_NIM_DEFAULT_MODEL];
+  const raw = await cacheGetSafe(EVENTS_KEY, 999999999);
+  const groups = groupGdeltRows(dedupHighConfidence(raw?.data ?? [])).slice(0, PROBE_GROUPS);
+  if (groups.length === 0) {
+    res.status(200).json({ ok: false, reason: "no_raw_events" });
+    return;
+  }
+  const userPrompt = buildBatchUserPromptV3(
+    groups.map((group) => ({ group, matchedNews: [], bellingcatHits: [], temporalEvents: [] }))
+  );
+  const client = new OpenAI2({
+    apiKey: env.NVIDIA_NIM_API_KEY,
+    baseURL: NVIDIA_NIM_BASE,
+    timeout: PROBE_TIMEOUT_MS3,
+    maxRetries: 0
+  });
+  const results = await Promise.all(models.map((m) => probeModel(client, m, userPrompt)));
+  log32.info({ results }, "llm probe complete");
+  res.status(200).json({ ok: true, groups: groups.length, results });
+});
+
+// server/routes/markets.ts
+import { Router as Router11 } from "express";
 import { z as z10 } from "zod";
 
 // server/adapters/yahoo-finance.ts
-var log32 = logger.child({ module: "yahoo-finance" });
+var log33 = logger.child({ module: "yahoo-finance" });
 var TICKERS = ["BZ=F", "CL=F", "XLE", "USO", "XOM"];
 var DISPLAY_NAMES = {
   "BZ=F": "Brent",
@@ -85270,19 +85551,19 @@ async function fetchTicker(symbol, range = "1d") {
       signal: AbortSignal.timeout(1e4)
     });
     if (!resp.ok) {
-      log32.warn({ symbol, status: resp.status }, "HTTP error");
+      log33.warn({ symbol, status: resp.status }, "HTTP error");
       return null;
     }
     const json = await resp.json();
     const result = json.chart?.result?.[0];
     if (!result) {
-      log32.warn({ symbol }, "no chart result");
+      log33.warn({ symbol }, "no chart result");
       return null;
     }
     const { meta, timestamp: rawTimestamps, indicators } = result;
     const quote = indicators?.quote?.[0];
     if (!meta || !rawTimestamps || !quote) {
-      log32.warn({ symbol }, "missing meta/timestamps/quote");
+      log33.warn({ symbol }, "missing meta/timestamps/quote");
       return null;
     }
     const price = meta.regularMarketPrice;
@@ -85319,7 +85600,7 @@ async function fetchTicker(symbol, range = "1d") {
       history: { timestamps, closes, highs, lows }
     };
   } catch (err) {
-    log32.warn({ err, symbol }, "fetch error");
+    log33.warn({ err, symbol }, "fetch error");
     return null;
   }
 }
@@ -85330,11 +85611,11 @@ async function fetchMarkets(range = "1d") {
 
 // server/routes/markets.ts
 init_redis();
-var log33 = logger.child({ module: "markets" });
+var log34 = logger.child({ module: "markets" });
 var marketsQuerySchema = z10.object({
   range: z10.enum(["1d", "5d", "1mo", "ytd"]).default("1d")
 });
-var marketsRouter = Router10();
+var marketsRouter = Router11();
 marketsRouter.get("/", validateQuery(marketsQuerySchema), async (_req, res) => {
   const { range } = res.locals.validatedQuery;
   const cacheKey2 = `markets:yahoo:${range}`;
@@ -85346,24 +85627,24 @@ marketsRouter.get("/", validateQuery(marketsQuerySchema), async (_req, res) => {
     const quotes = await fetchMarkets(range);
     if (quotes.length > 0) {
       await cacheSetSafe(cacheKey2, quotes, MARKETS_REDIS_TTL_SEC);
-      log33.info(
+      log34.info(
         { count: quotes.length, total: 5, range, tickers: quotes.map((q) => q.symbol) },
         "fetched tickers"
       );
       res.json({ data: quotes, stale: false, lastFresh: Date.now() });
     } else if (cached) {
-      log33.warn("all tickers failed, serving stale cache");
+      log34.warn("all tickers failed, serving stale cache");
       res.json({
         data: cached.data,
         stale: true,
         lastFresh: cached.lastFresh
       });
     } else {
-      log33.error("all tickers failed with no cache available");
+      log34.error("all tickers failed with no cache available");
       res.status(502).json({ error: "No market data available", code: "UPSTREAM_ERROR", statusCode: 502 });
     }
   } catch (err) {
-    log33.error({ err }, "upstream error");
+    log34.error({ err }, "upstream error");
     if (cached) {
       res.json({
         data: cached.data,
@@ -85381,7 +85662,7 @@ marketsRouter.get("/", validateQuery(marketsQuerySchema), async (_req, res) => {
 });
 
 // server/routes/news.ts
-import { Router as Router11 } from "express";
+import { Router as Router12 } from "express";
 import { z as z11 } from "zod";
 
 // server/lib/newsClustering.ts
@@ -85509,7 +85790,7 @@ async function fetchGdeltArticles() {
 
 // server/adapters/rss.ts
 import { XMLParser } from "fast-xml-parser";
-var log34 = logger.child({ module: "rss" });
+var log35 = logger.child({ module: "rss" });
 function stripHtml(html) {
   return html.replace(/<[^>]*>/g, "").trim();
 }
@@ -85569,7 +85850,7 @@ async function fetchAllRssFeeds() {
     if (result.status === "fulfilled") {
       articles.push(...result.value);
     } else {
-      log34.warn({ err: result.reason }, "feed fetch failed");
+      log35.warn({ err: result.reason }, "feed fetch failed");
     }
   }
   return articles;
@@ -85771,13 +86052,13 @@ function filterAndScoreArticles(articles) {
 }
 
 // server/routes/news.ts
-var log35 = logger.child({ module: "news" });
+var log36 = logger.child({ module: "news" });
 var newsQuerySchema = z11.object({
   refresh: z11.enum(["true", "false"]).optional().transform((v) => v === "true")
 });
 var NEWS_FEED_KEY = "news:feed";
 var NEWS_RSS_ONLY_KEY2 = "news:feed:rss-only";
-var newsRouter = Router11();
+var newsRouter = Router12();
 newsRouter.get("/", validateQuery(newsQuerySchema), async (_req, res) => {
   const { refresh: forceRefresh } = res.locals.validatedQuery;
   const cached = forceRefresh ? null : await cacheGetSafe(NEWS_FEED_KEY, NEWS_CACHE_TTL);
@@ -85789,11 +86070,11 @@ newsRouter.get("/", validateQuery(newsQuerySchema), async (_req, res) => {
     const [gdeltArticles, rssArticles] = await Promise.all([
       fetchGdeltArticles().catch((err) => {
         gdeltFailed = true;
-        log35.warn({ err }, "GDELT fetch failed (non-fatal, falling back to RSS-only)");
+        log36.warn({ err }, "GDELT fetch failed (non-fatal, falling back to RSS-only)");
         return [];
       }),
       fetchAllRssFeeds().catch((err) => {
-        log35.warn({ err }, "RSS fetch failed (non-fatal)");
+        log36.warn({ err }, "RSS fetch failed (non-fatal)");
         return [];
       })
     ]);
@@ -85823,13 +86104,13 @@ newsRouter.get("/", validateQuery(newsQuerySchema), async (_req, res) => {
     }
     const gdeltCount = gdeltArticles.length;
     const rssCount = rssArticles.length;
-    log35.info(
+    log36.info(
       { gdeltCount, rssCount, clusterCount: clusters.length, gdeltFailed },
       "fetched and clustered news"
     );
     res.json({ data: clusters, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log35.error({ err }, "upstream error");
+    log36.error({ err }, "upstream error");
     if (cached) {
       res.json({ data: cached.data, stale: true, lastFresh: cached.lastFresh });
     } else {
@@ -85840,7 +86121,7 @@ newsRouter.get("/", validateQuery(newsQuerySchema), async (_req, res) => {
 
 // server/routes/operator-status.ts
 init_redis();
-import { Router as Router12 } from "express";
+import { Router as Router13 } from "express";
 
 // server/lib/actorClassifier.ts
 var RAW_CAMEO_REGEX = /^[A-Z]{3,6}$/;
@@ -85871,8 +86152,8 @@ function classifyEventActors(actors, cameoCodebook) {
 }
 
 // server/routes/operator-status.ts
-var log36 = logger.child({ module: "operator-status" });
-var operatorStatusRouter = Router12();
+var log37 = logger.child({ module: "operator-status" });
+var operatorStatusRouter = Router13();
 var LIMIT_DRILL_DOWN = 20;
 var INLINE_CAMEO_CODES = /* @__PURE__ */ new Set([
   // Country-military (3-letter country prefix + MIL)
@@ -85954,7 +86235,7 @@ async function buildDeadUrlSample() {
     } while (cursor !== 0 && cursor !== "0");
     return { sample, countsByStatus };
   } catch (err) {
-    log36.warn({ err }, "failed to build dead-URL drill-down sample");
+    log37.warn({ err }, "failed to build dead-URL drill-down sample");
     return { sample: [], countsByStatus: {} };
   }
 }
@@ -85968,7 +86249,7 @@ operatorStatusRouter.get(
       try {
         auditMembers = await redis.smembers("operator:audit-log") ?? [];
       } catch (err) {
-        log36.warn({ err }, "failed to read operator:audit-log");
+        log37.warn({ err }, "failed to read operator:audit-log");
       }
       const entries = auditMembers.map((raw) => {
         try {
@@ -86010,14 +86291,14 @@ operatorStatusRouter.get(
           advEval = raw;
         }
       } catch (err) {
-        log36.warn({ err }, "failed to read events:llm-eval-adversarial:v3");
+        log37.warn({ err }, "failed to read events:llm-eval-adversarial:v3");
       }
       let deadUrlCount = 0;
       try {
         const raw = await redis.get(URL_LIVENESS_COUNT_KEY);
         deadUrlCount = Math.max(0, Number(raw) || 0);
       } catch (err) {
-        log36.warn({ err }, "failed to read events:url-liveness-count");
+        log37.warn({ err }, "failed to read events:url-liveness-count");
       }
       const last24hPrunes = last24h.filter((e) => e.operation === "prune-dead-urls").length;
       const { sample: deadUrlSample, countsByStatus } = await buildDeadUrlSample();
@@ -86076,7 +86357,7 @@ operatorStatusRouter.get(
           };
         }
       } catch (err) {
-        log36.warn({ err }, "failed to compute actorQuality block");
+        log37.warn({ err }, "failed to compute actorQuality block");
       }
       let tokenBudget = null;
       try {
@@ -86100,13 +86381,13 @@ operatorStatusRouter.get(
           costShadow: { tokensIn, tokensOut, usd }
         };
       } catch (err) {
-        log36.warn({ err }, "failed to compute tokenBudget block");
+        log37.warn({ err }, "failed to compute tokenBudget block");
       }
       let trendHistory = null;
       try {
         trendHistory = await readTrendHistory();
       } catch (err) {
-        log36.warn({ err }, "failed to read trendHistory ring");
+        log37.warn({ err }, "failed to read trendHistory ring");
       }
       let rateLimiter = null;
       try {
@@ -86125,7 +86406,7 @@ operatorStatusRouter.get(
         );
         rateLimiter = { tiers };
       } catch (err) {
-        log36.warn({ err }, "failed to compute rateLimiter block");
+        log37.warn({ err }, "failed to compute rateLimiter block");
       }
       res.json({
         audit24h,
@@ -86138,7 +86419,7 @@ operatorStatusRouter.get(
         rateLimiter
       });
     } catch (err) {
-      log36.error({ err }, "/api/operator-status failed");
+      log37.error({ err }, "/api/operator-status failed");
       res.status(500).json({ error: "operator_status_failed" });
     }
   }
@@ -86146,17 +86427,17 @@ operatorStatusRouter.get(
 
 // server/routes/refresh-events-cron.ts
 init_redis();
-import { timingSafeEqual as timingSafeEqual4 } from "crypto";
-import { Router as Router13 } from "express";
-var log37 = logger.child({ module: "refresh-events-cron" });
-var refreshEventsCronRouter = Router13();
+import { timingSafeEqual as timingSafeEqual5 } from "crypto";
+import { Router as Router14 } from "express";
+var log38 = logger.child({ module: "refresh-events-cron" });
+var refreshEventsCronRouter = Router14();
 refreshEventsCronRouter.get("/", async (req, res) => {
   if (env.CRON_SECRET) {
     const auth = req.header("Authorization") ?? req.header("authorization") ?? "";
     const expected = `Bearer ${env.CRON_SECRET}`;
     const a = Buffer.from(auth);
     const b = Buffer.from(expected);
-    if (a.length !== b.length || !timingSafeEqual4(a, b)) {
+    if (a.length !== b.length || !timingSafeEqual5(a, b)) {
       res.status(401).json({ error: "unauthorized" });
       return;
     }
@@ -86169,13 +86450,13 @@ refreshEventsCronRouter.get("/", async (req, res) => {
       forceCooldown
     });
     const durationMs = Date.now() - t0;
-    log37.info({ result, durationMs, forceCooldown }, "refresh-events cron dispatched");
+    log38.info({ result, durationMs, forceCooldown }, "refresh-events cron dispatched");
     await cacheSetSafe("cron:lastTick:refresh-events", Date.now(), CRON_LASTTICK_TTL_SEC);
     res.status(200).json({ ok: true, durationMs, ...result });
   } catch (err) {
     const durationMs = Date.now() - t0;
     const message = err instanceof Error ? err.message : String(err);
-    log37.error({ err: message, durationMs }, "refresh-events cron failed");
+    log38.error({ err: message, durationMs }, "refresh-events cron failed");
     res.status(500).json({
       ok: false,
       error: "refresh_failed",
@@ -86186,7 +86467,7 @@ refreshEventsCronRouter.get("/", async (req, res) => {
 });
 
 // server/routes/ships.ts
-import { Router as Router14 } from "express";
+import { Router as Router15 } from "express";
 
 // server/adapters/aisstream.ts
 var DEFAULT_COLLECT_MS = 5e3;
@@ -86255,8 +86536,8 @@ async function collectShips() {
 
 // server/routes/ships.ts
 init_redis();
-var log38 = logger.child({ module: "ships" });
-var shipsRouter = Router14();
+var log39 = logger.child({ module: "ships" });
+var shipsRouter = Router15();
 var SHIPS_KEY = "ships:ais";
 var LOGICAL_TTL_MS2 = 3e4;
 var REDIS_TTL_SEC = 300;
@@ -86288,7 +86569,7 @@ shipsRouter.get("/", async (_req, res) => {
     await cacheSetSafe(SHIPS_KEY, merged, REDIS_TTL_SEC);
     res.json({ data: merged, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log38.error({ err }, "collectShips error");
+    log39.error({ err }, "collectShips error");
     if (cached) {
       res.json({ ...cached, stale: true });
     } else {
@@ -86298,17 +86579,17 @@ shipsRouter.get("/", async (_req, res) => {
 });
 
 // server/routes/sites.ts
-import { Router as Router15 } from "express";
+import { Router as Router16 } from "express";
 import { z as z12 } from "zod";
 init_redis();
-var log39 = logger.child({ module: "sites" });
+var log40 = logger.child({ module: "sites" });
 var sitesQuerySchema = z12.object({
   refresh: z12.enum(["true", "false"]).optional().transform((v) => v === "true")
 });
 var SITES_KEY2 = "sites:v3";
 var LOGICAL_TTL_MS3 = SITES_CACHE_TTL;
 var REDIS_TTL_SEC2 = 259200;
-var sitesRouter = Router15();
+var sitesRouter = Router16();
 sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
   const { refresh: forceRefresh } = res.locals.validatedQuery;
   const cached = await cacheGetSafe(SITES_KEY2, LOGICAL_TTL_MS3);
@@ -86333,7 +86614,7 @@ sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
         { sites: snapshot.sites, filterStats: snapshot.stats },
         REDIS_TTL_SEC2
       );
-      log39.info(
+      log40.info(
         { count: snapshot.sites.length, generatedAt: snapshot.generatedAt },
         "serving sites from committed snapshot; Overpass untouched"
       );
@@ -86356,7 +86637,7 @@ sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
       filterStats: stats
     });
   } catch (err) {
-    log39.error({ err }, "Overpass error");
+    log40.error({ err }, "Overpass error");
     if (cached) {
       const payload = cached.data;
       sendValidated(res, sitesResponseSchema, {
@@ -86376,8 +86657,8 @@ sitesRouter.get("/", validateQuery(sitesQuerySchema), async (_req, res) => {
 });
 
 // server/routes/sources.ts
-import { Router as Router16 } from "express";
-var sourcesRouter = Router16();
+import { Router as Router17 } from "express";
+var sourcesRouter = Router17();
 sourcesRouter.get("/", (_req, res) => {
   res.json({
     opensky: {
@@ -86390,11 +86671,11 @@ sourcesRouter.get("/", (_req, res) => {
 });
 
 // server/routes/water.ts
-import { Router as Router17 } from "express";
+import { Router as Router18 } from "express";
 import { z as z13 } from "zod";
 
 // server/adapters/open-meteo-precip.ts
-var log40 = logger.child({ module: "open-meteo-precip" });
+var log41 = logger.child({ module: "open-meteo-precip" });
 var REGIONAL_NORMALS_MM = {
   arid: 20,
   // Arabian Peninsula, central Iran, Sahara
@@ -86426,7 +86707,7 @@ async function fetchPrecipitation(locations) {
     }
   }
   const uniqueCells = Array.from(cellMap.values());
-  log40.info(
+  log41.info(
     {
       locations: locations.length,
       uniqueCells: uniqueCells.length,
@@ -86445,7 +86726,7 @@ async function fetchPrecipitation(locations) {
         signal: AbortSignal.timeout(TIMEOUT_MS3)
       });
       if (!res.ok) {
-        log40.warn(
+        log41.warn(
           { batch: Math.floor(i / BATCH_SIZE2), status: res.status },
           "batch returned error, skipping"
         );
@@ -86469,7 +86750,7 @@ async function fetchPrecipitation(locations) {
         });
       }
     } catch (batchErr) {
-      log40.warn({ err: batchErr, batch: Math.floor(i / BATCH_SIZE2) }, "batch failed, skipping");
+      log41.warn({ err: batchErr, batch: Math.floor(i / BATCH_SIZE2) }, "batch failed, skipping");
       continue;
     }
   }
@@ -86486,7 +86767,7 @@ async function fetchPrecipitation(locations) {
       updatedAt: now
     });
   }
-  log40.info(
+  log41.info(
     { cells: cellResults.size, mappedLocations: results.length },
     "precipitation fetch complete"
   );
@@ -86495,7 +86776,7 @@ async function fetchPrecipitation(locations) {
 
 // server/routes/water.ts
 init_redis();
-var log41 = logger.child({ module: "water" });
+var log42 = logger.child({ module: "water" });
 function buildEmptyFilterStats(source, generatedAt) {
   return {
     rawCounts: {},
@@ -86532,14 +86813,14 @@ function normalizePrecipCache(cached) {
   if (isPrecipEmptySentinel(cached)) return [];
   return cached;
 }
-var waterRouter = Router17();
+var waterRouter = Router18();
 waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
-  log41.info("GET /api/water hit");
+  log42.info("GET /api/water hit");
   const isCron = req.headers["user-agent"]?.includes("vercel-cron");
   const { refresh } = res.locals.validatedQuery;
   const forceRefresh = refresh && (isCron || process.env.NODE_ENV !== "production");
   const cached = await cacheGetSafe(FACILITIES_KEY, WATER_CACHE_TTL);
-  log41.info(
+  log42.info(
     { cacheHit: !!cached, count: cached?.data.facilities.length, stale: cached?.stale },
     "cache result"
   );
@@ -86585,7 +86866,7 @@ waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
         { facilities: snapshot.facilities, filterStats: snapshot.stats },
         WATER_REDIS_TTL_SEC
       );
-      log41.info(
+      log42.info(
         { count: snapshot.facilities.length, generatedAt: snapshot.generatedAt },
         "serving water facilities from committed snapshot; Overpass untouched"
       );
@@ -86609,7 +86890,7 @@ waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
       filterStats
     });
   } catch (err) {
-    log41.error({ err }, "Overpass error");
+    log42.error({ err }, "Overpass error");
     if (cached) {
       const payload = cached.data;
       sendValidated(res, waterResponseSchema, {
@@ -86623,7 +86904,7 @@ waterRouter.get("/", validateQuery(waterQuerySchema), async (req, res) => {
         }
       });
     } else {
-      log41.warn("Overpass failed, returning empty");
+      log42.warn("Overpass failed, returning empty");
       sendValidated(res, waterResponseSchema, {
         data: [],
         stale: true,
@@ -86674,7 +86955,7 @@ waterRouter.get("/precip", validateQuery(waterQuerySchema), async (_req, res) =>
     }
     res.json({ data: precipData, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log41.error({ err }, "precipitation fetch error");
+    log42.error({ err }, "precipitation fetch error");
     if (cachedPrecip) {
       res.json({
         data: normalizePrecipCache(cachedPrecip.data),
@@ -86688,7 +86969,7 @@ waterRouter.get("/precip", validateQuery(waterQuerySchema), async (_req, res) =>
 });
 
 // server/routes/weather.ts
-import { Router as Router18 } from "express";
+import { Router as Router19 } from "express";
 
 // server/adapters/open-meteo.ts
 var BASE_URL2 = "https://api.open-meteo.com/v1/forecast";
@@ -86740,8 +87021,8 @@ async function fetchWeather() {
 
 // server/routes/weather.ts
 init_redis();
-var log42 = logger.child({ module: "weather" });
-var weatherRouter = Router18();
+var log43 = logger.child({ module: "weather" });
+var weatherRouter = Router19();
 weatherRouter.get("/", async (_req, res) => {
   const cached = await cacheGetSafe(WEATHER_CACHE_KEY, WEATHER_CACHE_TTL);
   if (cached && !cached.stale) {
@@ -86750,10 +87031,10 @@ weatherRouter.get("/", async (_req, res) => {
   try {
     const points = await fetchWeather();
     await cacheSetSafe(WEATHER_CACHE_KEY, points, WEATHER_REDIS_TTL_SEC);
-    log42.info({ count: points.length }, "fetched grid points");
+    log43.info({ count: points.length }, "fetched grid points");
     res.json({ data: points, stale: false, lastFresh: Date.now() });
   } catch (err) {
-    log42.error({ err }, "upstream error");
+    log43.error({ err }, "upstream error");
     if (cached) {
       res.json({
         data: cached.data,
@@ -86826,6 +87107,7 @@ function createApp() {
   app2.use("/api/cron/warm", cronWarmRouter);
   app2.use("/api/cron/eval", evalCronRouter);
   app2.use("/api/cron/refresh-events", refreshEventsCronRouter);
+  app2.use("/api/cron/llm-probe", llmProbeCronRouter);
   app2.use("/api", rateLimiters.public);
   app2.use("/api/flights", rateLimiters.flights, cacheControl(5, 25), flightsRouter);
   app2.use("/api/ships", rateLimiters.ships, cacheControl(10, 20), shipsRouter);

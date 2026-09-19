@@ -227,6 +227,33 @@ export async function cacheGetSafe<T>(
 }
 
 /**
+ * Cache write for background jobs whose whole purpose is the write (the LLM
+ * pipeline's `events:llm:v3`). Unlike `cacheSetSafe` it waits longer than the
+ * 2 s request-path budget — the payload is the full enriched corpus — and it
+ * reports the outcome instead of swallowing it, so the caller cannot log
+ * "persisted" over a write that never landed. Never throws.
+ */
+const REDIS_BULK_WRITE_TIMEOUT_MS = 20_000;
+
+export async function cacheSetReported<T>(
+  key: string,
+  data: T,
+  redisTtlSec: number,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  memCache.set(key, { data, fetchedAt: Date.now() });
+  try {
+    await withTimeout(
+      cacheSet(key, data, redisTtlSec),
+      REDIS_BULK_WRITE_TIMEOUT_MS,
+      `cacheSet(${key})`,
+    );
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Safe cache write to both Redis and in-memory fallback.
  *
  * Always writes to memCache regardless of Redis success.

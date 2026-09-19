@@ -1,19 +1,14 @@
 // @vitest-environment node
 /**
- * Phase 35 D-12 (SIMPLIFY-02) one-key discipline guard.
+ * What `events:llm:v3` holds, and how often the eval harness runs.
  *
- * Asserts:
- *  1. `events:llm:v3` (terminal key) holds `ConflictEventEntity[]` shape —
- *     every element has `id/lat/lng/type` and NEVER the envelope keys
- *     `progress/complete/generatedAt`. This guards against a regression of
- *     Phase 27.4.1 commit `a5c8846`.
- *  2. `runEval()` is called exactly ONCE per run (Pitfall 8). The
- *     intermediate-flush helper does NOT call runEval.
+ *  1. Every write to `events:llm:v3` is a bare `ConflictEventEntity[]`.
+ *     `/api/events` and the dead-URL prune read the key as an array; an
+ *     envelope (`{ progress, complete, generatedAt, ... }`) would blank the map.
+ *  2. `runEval()` runs once per run, however many waves the run takes. It is a
+ *     measurement that spends LLM quota; once per wave would multiply it.
  *
- * Phase 35 D-12 (SIMPLIFY-02): the prior Test 2 (`events:llm:v3:partial`
- * holds LLMCachePayload envelope) was deleted alongside the writePartialCache
- * writer retirement. The terminal-key Test 1 is preserved; the one-key
- * discipline replaces the prior two-key discipline.
+ * LLM_V3_CONCURRENCY is pinned to 1 (wave = 4 groups).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -22,21 +17,25 @@ const { mockEnv } = vi.hoisted(() => ({
   mockEnv: {
     NVIDIA_NIM_API_KEY: 'fake',
     OPENROUTER_API_KEY: '',
-    LLM_BATCH_TIMEOUT_MS: 120_000, // Phase 30 D-02 retune (was 90_000)
+    LLM_BATCH_TIMEOUT_MS: 120_000,
     LLM_V3_CONCURRENCY: 1,
     V3_ADAPTIVE_BATCH: false,
     V3_LINEAGE_PREFILTER: false,
     V3_WATCHDOG_ROLLBACK_THRESHOLD: 2,
-    // Phase 30 D-04 (SIMPLIFY-01): legacy flush-cadence env var stripped
-    // from mockEnv when the Zod schema entry was deleted in Plan 03 Task 2.
-    LLM_BATCH_SIZE: 2, // Phase 30 D-07 — env-tunable (was hard-coded const)
+    LLM_BATCH_SIZE: 2,
     CRON_SECRET: '',
   },
 }));
 
+const LLM_KEY = 'events:llm:v3';
+
 const cacheStore = new Map<string, unknown>();
-const cacheSetSpy = vi.fn(async (key: string, data: unknown, _ttl: number) => {
+const cacheSetSafeSpy = vi.fn(async (key: string, data: unknown, _ttl: number) => {
   cacheStore.set(key, data);
+});
+const cacheSetReportedSpy = vi.fn(async (key: string, data: unknown, _ttl: number) => {
+  cacheStore.set(key, data);
+  return { ok: true } as const;
 });
 const cacheGetSpy = vi.fn(async (key: string, _maxAgeMs: number) =>
   cacheStore.has(key) ? { data: cacheStore.get(key), fetchedAt: Date.now() } : null,
@@ -44,45 +43,28 @@ const cacheGetSpy = vi.fn(async (key: string, _maxAgeMs: number) =>
 
 vi.mock('../../cache/redis.js', () => ({
   cacheGetSafe: cacheGetSpy,
-  cacheSetSafe: cacheSetSpy,
+  cacheSetSafe: cacheSetSafeSpy,
+  cacheSetReported: cacheSetReportedSpy,
   redis: {
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
-vi.mock('../../config.js', () => ({
-  env: mockEnv,
-}));
+vi.mock('../../config.js', () => ({ env: mockEnv }));
 
-vi.mock('@vercel/functions', () => ({
-  waitUntil: (p: Promise<unknown>) => {
-    void p.catch(() => {});
-  },
-}));
-
-// Phase 28.2.6 Plan 02 cross-plan defense — Task 3 swapped the IIFE wrapper
-// from `void (async () => {...})()` to `safeWaitUntil((async () => {...})())`.
-// The local-dev fallback in safeWaitUntil runs `promise.catch(...)` so the IIFE
-// still executes under test, but we mock the shim itself for clarity + so a
-// future regression that changes safeWaitUntil's local-dev path can't silently
-// break these tests. The pre-existing `vi.mock('@vercel/functions', ...)` is
-// retained as defense-in-depth — if anyone later removes the safeWaitUntil
-// mock, the @vercel/functions mock still keeps the IIFE running under test.
+// The run body is handed to safeWaitUntil and never awaited by the caller;
+// keeping the promise lets a test wait for the run to finish.
+let runPromise: Promise<unknown> = Promise.resolve();
 vi.mock('../../lib/safeWaitUntil.js', () => ({
   safeWaitUntil: (p: Promise<unknown>) => {
-    void p.catch(() => {});
+    runPromise = p.catch(() => {});
   },
 }));
 
 vi.mock('../../lib/logger.js', () => ({
   logger: {
-    child: () => ({
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    }),
+    child: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
   },
 }));
 
@@ -105,23 +87,32 @@ vi.mock('../../lib/sourceTiers.js', () => ({
   getHighestTier: vi.fn().mockReturnValue(2),
 }));
 
-const runEvalSpy = vi.fn().mockResolvedValue({
-  score: 0.85,
-  withinKm5: 30,
-  withinKm20: 35,
-  withinKm100: 40,
-  total: 50,
-});
-vi.mock('../../lib/llmEvalHarness.js', () => ({
-  runEval: runEvalSpy,
-}));
+const runEvalSpy = vi
+  .fn()
+  .mockResolvedValue({ within5km: 1, within20km: 1, within100km: 1, total: 1 });
+vi.mock('../../lib/llmEvalHarness.js', () => ({ runEval: runEvalSpy }));
 
 const groupGdeltRowsMock = vi.fn();
 vi.mock('../../lib/eventGrouping.js', () => ({
   groupGdeltRows: groupGdeltRowsMock,
-  // GDELT-MATCH-02 — pipeline runs dedup pre-pass before grouping; identity
-  // mock keeps these assertions driving group keys through groupGdeltRowsMock.
   dedupHighConfidence: vi.fn((entities: unknown[]) => entities),
+  enrichedIdForGroup: (key: string) => `llm-v3-${key}`,
+}));
+
+vi.mock('../../lib/llmDLQ.js', () => ({ countDLQ: vi.fn(async () => 0) }));
+
+vi.mock('../../lib/llmRunHistory.js', () => ({
+  openRunRecord: vi.fn(async () => {}),
+  closeRunRecord: vi.fn(async () => {}),
+}));
+
+// The URL-liveness post-step runs after every extraction; stubbed so these
+// tests touch neither Redis nor the network.
+vi.mock('../../lib/urlLiveness.js', () => ({
+  buildProbeCandidates: vi.fn(async () => ({ candidates: [], classifiedNoUrl: 0 })),
+  pruneDeadUrlEvents: vi.fn(async () => ({ prunedCount: 0, prunedIds: [] })),
+  runProbeSweep: vi.fn(async () => ({ probed: 0, skippedBudget: 0 })),
+  SWEEP_SAFETY_MARGIN_MS: 60_000,
 }));
 
 const { llmProgressSingleton } = vi.hoisted(() => ({
@@ -132,125 +123,13 @@ vi.mock('../../lib/llmProgress.js', () => ({
     Object.assign(llmProgressSingleton, patch);
   }),
   resetProgress: vi.fn(() => {
-    for (const k of Object.keys(llmProgressSingleton)) {
-      delete llmProgressSingleton[k];
-    }
+    for (const k of Object.keys(llmProgressSingleton)) delete llmProgressSingleton[k];
     llmProgressSingleton.stage = 'grouping';
     llmProgressSingleton.startedAt = Date.now();
   }),
   llmProgress: llmProgressSingleton,
   buildSummary: vi.fn().mockReturnValue({}),
 }));
-
-let totalBatchesForRun = 0;
-const enrichedEventsByBatch: Record<number, unknown[]> = {};
-
-const processEventGroupsMock = vi.fn(
-  async (
-    _groups: unknown[],
-    onBatchComplete?:
-      | ((completed: number, total: number) => void)
-      | ((completed: number, total: number) => Promise<void>),
-  ) => {
-    const total = totalBatchesForRun;
-    const allEvents: unknown[] = [];
-    for (let c = 1; c <= total; c++) {
-      const batchEvents = enrichedEventsByBatch[c] ?? [];
-      allEvents.push(...batchEvents);
-      // Phase 35 D-12 (SIMPLIFY-02): writePartialCache writer retired, so this
-      // mock no longer simulates the partial-key write. Only onBatchComplete
-      // drives terminal-key writes via the pipeline now.
-      const ret = onBatchComplete?.(c, total);
-      if (ret && typeof (ret as Promise<void>).then === 'function') {
-        await ret;
-      }
-    }
-    return {
-      schemaVersion: 'v3' as const,
-      events: allEvents,
-      matchedNewsByGroup: new Map(),
-      bellingcatByGroup: new Map(),
-    };
-  },
-);
-
-// Phase 38 LLM-PURGE-01 — pipeline now imports the v3 extractor directly
-// (the `llmEventExtractor.js` stub barrel was deleted). geocodeEnrichedEventsV3
-// takes the v3-native signature `(events, groupsByKey, matchedNewsByGroup,
-// bellingcatByGroup, onComplete)` and returns a flat array (no tagged shape).
-const geocodeEnrichedEventsMock = vi.fn(
-  async (
-    events: Array<Record<string, unknown>>,
-    _groupsByKey: any,
-    _matchedNews: any,
-    _bellingcat: any,
-    onProgress?: any,
-  ) => {
-    const out = events.map((e) => {
-      const groupKey = (e as { groupKey: string }).groupKey;
-      return {
-        ...e,
-        resolvedLat: 35.0 + groupKey.length * 0.001,
-        resolvedLng: 50.0 + groupKey.length * 0.001,
-        displayName: `Test Site ${groupKey}`,
-        geocodeProvenance: 'nominatim-direct' as const,
-        precision: 'city' as const,
-        suspect: false,
-        actionGeoDistanceKm: 0,
-      };
-    });
-    if (typeof onProgress === 'function') {
-      onProgress(out.length, out.length);
-    }
-    return out;
-  },
-);
-
-vi.mock('../../lib/llmEventExtractor.v3.js', () => ({
-  processEventGroupsV3: processEventGroupsMock,
-  geocodeEnrichedEventsV3: geocodeEnrichedEventsMock,
-}));
-
-interface MinimalEntity {
-  id: string;
-  type: string;
-  lat: number;
-  lng: number;
-  timestamp: number;
-  label: string;
-  data: Record<string, unknown>;
-}
-
-function makeRawEntity(id: string): MinimalEntity {
-  return {
-    id,
-    type: 'airstrike',
-    lat: 35,
-    lng: 50,
-    timestamp: Date.UTC(2026, 3, 15),
-    label: 't',
-    data: {
-      eventType: 'Aerial weapons',
-      cameoCode: '195',
-      numMentions: 5,
-      numSources: 2,
-    },
-  };
-}
-
-function makeGroup(key: string) {
-  return {
-    key,
-    entities: [makeRawEntity(`raw-${key}`)],
-    centroidLat: 35,
-    centroidLng: 50,
-    primaryCameo: '195',
-    timestamp: Date.UTC(2026, 3, 15),
-    totalMentions: 5,
-    totalSources: 2,
-    sourceUrls: ['https://example.com'],
-  };
-}
 
 function makeEnrichedV3Event(groupKey: string): Record<string, unknown> {
   return {
@@ -279,80 +158,142 @@ function makeEnrichedV3Event(groupKey: string): Record<string, unknown> {
   };
 }
 
-async function driveRun(numBatches: number) {
-  totalBatchesForRun = numBatches;
-  for (let c = 1; c <= numBatches; c++) {
-    enrichedEventsByBatch[c] = [makeEnrichedV3Event(`g${c}`)];
-  }
-  const rawEvents = Array.from({ length: numBatches }, (_, i) => makeRawEntity(`raw-${i + 1}`));
-  cacheStore.set('events:gdelt', rawEvents);
-  groupGdeltRowsMock.mockReturnValue(
-    Array.from({ length: numBatches }, (_, i) => makeGroup(`g${i + 1}`)),
+// The extractor is called once per wave with that wave's groups and returns
+// one enriched event per group.
+const processEventGroupsMock = vi.fn(
+  async (groups: Array<{ key: string }>, onBatchComplete?: (c: number, t: number) => void) => {
+    const total = Math.ceil(groups.length / 2);
+    for (let c = 1; c <= total; c++) onBatchComplete?.(c, total);
+    return {
+      schemaVersion: 'v3' as const,
+      events: groups.map((g) => makeEnrichedV3Event(g.key)),
+      matchedNewsByGroup: new Map(),
+      bellingcatByGroup: new Map(),
+    };
+  },
+);
+
+const geocodeEnrichedEventsMock = vi.fn(
+  async (
+    events: Array<Record<string, unknown>>,
+    _groupsByKey: unknown,
+    _matchedNews: unknown,
+    _bellingcat: unknown,
+    onProgress?: (completed: number, total: number) => void,
+  ) => {
+    const out = events.map((e) => ({
+      ...e,
+      resolvedLat: 35,
+      resolvedLng: 50,
+      displayName: `Test Site ${String(e.groupKey)}`,
+      geocodeProvenance: 'nominatim-direct' as const,
+      precision: 'city' as const,
+      suspect: false,
+      actionGeoDistanceKm: 0,
+    }));
+    onProgress?.(out.length, out.length);
+    return out;
+  },
+);
+
+vi.mock('../../lib/llmEventExtractor.v3.js', () => ({
+  processEventGroupsV3: processEventGroupsMock,
+  geocodeEnrichedEventsV3: geocodeEnrichedEventsMock,
+}));
+
+function makeRawEntity(id: string) {
+  return {
+    id,
+    type: 'airstrike',
+    lat: 35,
+    lng: 50,
+    timestamp: Date.UTC(2026, 3, 15),
+    label: 't',
+    data: { eventType: 'Aerial weapons', cameoCode: '195', numMentions: 5, numSources: 2 },
+  };
+}
+
+function makeGroup(key: string) {
+  return {
+    key,
+    entities: [makeRawEntity(`raw-${key}`)],
+    centroidLat: 35,
+    centroidLng: 50,
+    primaryCameo: '195',
+    timestamp: Date.UTC(2026, 3, 15),
+    totalMentions: 5,
+    totalSources: 2,
+    sourceUrls: ['https://example.com'],
+  };
+}
+
+async function driveRun(numGroups: number) {
+  const keys = Array.from({ length: numGroups }, (_, i) => `g${i + 1}`);
+  cacheStore.set(
+    'events:gdelt',
+    keys.map((k) => makeRawEntity(`raw-${k}`)),
   );
+  groupGdeltRowsMock.mockReturnValue(keys.map(makeGroup));
 
   const { runRefreshExtraction } = await import('../../lib/llmExtractionPipeline.js');
   await runRefreshExtraction({ triggeredBy: 'cron', forceCooldown: true });
-  for (let i = 0; i < 50; i++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await runPromise;
 }
 
 beforeEach(() => {
   cacheStore.clear();
-  cacheSetSpy.mockClear();
+  cacheSetSafeSpy.mockClear();
+  cacheSetReportedSpy.mockClear();
   cacheGetSpy.mockClear();
   processEventGroupsMock.mockClear();
   geocodeEnrichedEventsMock.mockClear();
   groupGdeltRowsMock.mockClear();
   runEvalSpy.mockClear();
-  for (const k of Object.keys(llmProgressSingleton)) {
-    delete llmProgressSingleton[k];
-  }
+  for (const k of Object.keys(llmProgressSingleton)) delete llmProgressSingleton[k];
   llmProgressSingleton.stage = 'idle';
+  runPromise = Promise.resolve();
 });
 
-describe('runRefreshExtraction — Phase 35 D-12 one-key discipline + Pitfall 8', () => {
-  it('one-key discipline: events:llm:v3 holds ConflictEventEntity[] (terminal-key shape)', async () => {
+describe('runRefreshExtraction — events:llm:v3 holds a bare ConflictEventEntity[]', () => {
+  it('every wave writes an array of entities, never a progress envelope', async () => {
     await driveRun(12);
 
-    const terminalCalls = cacheSetSpy.mock.calls.filter(([k]) => k === 'events:llm:v3');
-    // Phase 30 D-04 (SIMPLIFY-01): the prior assertion was
-    // `.toBeGreaterThanOrEqual(2)` (1 intermediate flush at batch 10 +
-    // 1 terminal). With the periodic-flush mechanism retired the terminal
-    // write is the sole writer, so the happy-path expectation is exactly 1.
-    expect(terminalCalls.length).toBe(1);
-
-    for (const [, data] of terminalCalls) {
+    const writes = cacheSetReportedSpy.mock.calls.filter(([k]) => k === LLM_KEY);
+    expect(writes).toHaveLength(3);
+    for (const [, data] of writes) {
       expect(Array.isArray(data)).toBe(true);
-      const arr = data as Array<Record<string, unknown>>;
-      expect(arr.length).toBeGreaterThan(0);
-      const first = arr[0]!;
-      expect(first).toHaveProperty('id');
-      expect(first).toHaveProperty('lat');
-      expect(first).toHaveProperty('lng');
-      expect(first).toHaveProperty('type');
-      // Negative shape — must NOT have envelope keys.
-      expect(first).not.toHaveProperty('progress');
-      expect(first).not.toHaveProperty('complete');
-      expect(first).not.toHaveProperty('generatedAt');
+      const entities = data as Array<Record<string, unknown>>;
+      expect(entities.length).toBeGreaterThan(0);
+      for (const entity of entities) {
+        expect(entity.id).toMatch(/^llm-v3-g\d+$/);
+        expect(typeof entity.lat).toBe('number');
+        expect(typeof entity.lng).toBe('number');
+        expect(entity.type).toBe('airstrike');
+        expect(entity).not.toHaveProperty('progress');
+        expect(entity).not.toHaveProperty('complete');
+        expect(entity).not.toHaveProperty('generatedAt');
+      }
     }
   });
 
-  it('intermediate flushes do NOT call runEval() (Pitfall 8)', async () => {
-    await driveRun(12);
-    // runEval is called once after the FINAL geocode — never per intermediate
-    // flush. If a regression makes the periodic-flush helper call runEval(),
-    // daily LLM token spend triples.
-    expect(runEvalSpy).toHaveBeenCalledTimes(1);
-  });
+  it('an entity carries the enrichment and the geocode provenance', async () => {
+    await driveRun(1);
 
-  it('mergeAndPersistLlmEntities is called exactly once per successful run (D-04 / SIMPLIFY-01)', async () => {
+    const [entity] = cacheStore.get(LLM_KEY) as Array<{ data: Record<string, unknown> }>;
+    expect(entity?.data).toMatchObject({
+      llmProcessed: true,
+      summary: 'test summary',
+      precision: 'city',
+      geocodeProvenance: 'nominatim-direct',
+    });
+  });
+});
+
+describe('runRefreshExtraction — the eval harness is a once-per-run measurement', () => {
+  it('a three-wave run calls runEval once, not once per wave', async () => {
     await driveRun(12);
-    // mergeAndPersistLlmEntities is the writer of events:llm:v3. Pre-Phase-30
-    // it fired every N batches (incremental flush); Phase 30 D-04 retires
-    // that tier and the helper is now invoked exactly once at end-of-pipeline.
-    // Mirrors the runEval-exactly-once assertion shape above.
-    const terminalCalls = cacheSetSpy.mock.calls.filter(([k]) => k === 'events:llm:v3');
-    expect(terminalCalls.length).toBe(1);
+
+    expect(processEventGroupsMock).toHaveBeenCalledTimes(3);
+    expect(runEvalSpy).toHaveBeenCalledTimes(1);
   });
 });

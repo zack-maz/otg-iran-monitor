@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { loadDevLLMCacheV2 } from '../cache/devFileCache.js';
 import { cacheGetSafe, cacheSetSafe, redis } from '../cache/redis.js';
 import { WAR_START, CACHE_TTL } from '../config.js';
-import { groupGdeltRows } from '../lib/eventGrouping.js';
+import { fillWithRawEvents, groupGdeltRows } from '../lib/eventGrouping.js';
 // Phase 39 Plan 04 OBS-FLIGHT-03/06 — the Bearer-gated /llm-history read
 // surface consumes both flight-recorder list modules + their cold-start
 // hydration helpers (repopulate the in-memory singleton after a Fluid Compute
@@ -678,7 +678,18 @@ eventsRouter.get('/', validateQuery(eventsQuerySchema), async (_req, res) => {
   );
   if (llmCached) llmCached = coerceCachedEvents(llmCached);
   if (llmCached && !llmCached.stale) {
-    return sendNormalizedEvents(res, llmCached);
+    // The enriched cache fills a wave at a time, so it may cover only part of
+    // the corpus: top it up with the raw rows of the groups it lacks.
+    const rawForFill = forceBackfill
+      ? null
+      : await cacheGetSafe<ConflictEventEntity[]>(EVENTS_KEY, LOGICAL_TTL_MS);
+    if (rawForFill && !rawForFill.stale) {
+      return sendNormalizedEvents(res, {
+        ...llmCached,
+        data: fillWithRawEvents(llmCached.data, rawForFill.data),
+      });
+    }
+    // Raw cache cold or stale: fall through so it is refreshed below.
   }
 
   // Dev fallback: if Redis LLM cache is empty, try local file cache to avoid
@@ -726,8 +737,8 @@ eventsRouter.get('/', validateQuery(eventsQuerySchema), async (_req, res) => {
   if (cached && !cached.stale) {
     if (llmCached?.data) {
       return sendNormalizedEvents(res, {
-        data: llmCached.data,
-        stale: true,
+        data: fillWithRawEvents(llmCached.data, cached.data),
+        stale: llmCached.stale,
         lastFresh: llmCached.lastFresh,
       });
     }
@@ -744,11 +755,11 @@ eventsRouter.get('/', validateQuery(eventsQuerySchema), async (_req, res) => {
     // anti-pattern #17: do NOT re-introduce extraction triggers on the read
     // path. See CLAUDE.md "Cron-Driven Pipeline Trigger (Phase 27.4.6)".
 
-    // Serve immediately: stale LLM cache if available, otherwise raw GDELT
+    // Serve immediately: the enriched cache topped up with raw rows, otherwise raw GDELT
     if (llmCached?.data) {
       return sendNormalizedEvents(res, {
-        data: llmCached.data,
-        stale: true,
+        data: fillWithRawEvents(llmCached.data, merged),
+        stale: llmCached.stale,
         lastFresh: llmCached.lastFresh,
       });
     }
@@ -764,9 +775,17 @@ eventsRouter.get('/', validateQuery(eventsQuerySchema), async (_req, res) => {
       // Prune stale entries even on error
       const pruned = cached.data.filter((e) => e.timestamp >= WAR_START);
       sendNormalizedEvents(res, {
-        data: pruned,
+        data: llmCached?.data ? fillWithRawEvents(llmCached.data, pruned) : pruned,
         stale: true,
         lastFresh: cached.lastFresh,
+      });
+    } else if (llmCached?.data) {
+      // No raw rows to top up with, but the enriched cache is servable on its
+      // own: the map never goes blank because GDELT is down.
+      sendNormalizedEvents(res, {
+        data: llmCached.data,
+        stale: true,
+        lastFresh: llmCached.lastFresh,
       });
     } else {
       throw new AppError(502, 'UPSTREAM_FAIL', `gdelt fetch failed: ${(err as Error).message}`);

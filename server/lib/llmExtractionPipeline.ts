@@ -35,10 +35,11 @@
 
 import { isLLMConfigured } from '../adapters/llm-provider.js';
 import { saveDevLLMCacheV2 } from '../cache/devFileCache.js';
-import { cacheGetSafe, cacheSetSafe, redis } from '../cache/redis.js';
+import { cacheGetSafe, cacheSetReported, cacheSetSafe, redis } from '../cache/redis.js';
+import { env } from '../config.js';
 
 import { checkCorroboration } from './corroboration.js';
-import { dedupHighConfidence, groupGdeltRows } from './eventGrouping.js';
+import { dedupHighConfidence, enrichedIdForGroup, groupGdeltRows } from './eventGrouping.js';
 import { countDLQ } from './llmDLQ.js';
 import { runEval } from './llmEvalHarness.js';
 import {
@@ -83,6 +84,7 @@ import {
 } from './urlLiveness.js';
 
 import type { ConflictEventEntity, NewsCluster } from '../types.js';
+import type { EventGroup } from './eventGrouping.js';
 import type { GeocodeProvenance } from './llmSchema.js';
 
 const log = logger.child({ module: 'llm-extraction-pipeline' });
@@ -153,6 +155,23 @@ const LLM_SUMMARY_TTL_SEC = 86_400;
 /** v3 BATCH_SIZE used for progress math. v2's BATCH_SIZE=2 is gone; v3 also uses 2. */
 const BATCH_SIZE_ACTIVE = 2;
 
+// Run budget, measured from the start of the cron request. The function is
+// killed at 800 s (`maxDuration` in vercel.json), and the URL-liveness sweep
+// that follows the extraction ends itself 60 s before that.
+/** No new LLM wave starts after this; a wave in flight still finishes. */
+const LLM_PHASE_BUDGET_MS = 480_000;
+/** Geocoding stops here; whatever is geocoded by then is persisted. */
+const GEOCODE_PHASE_BUDGET_MS = 660_000;
+/** The eval harness only starts if the run got here faster than this. */
+const EVAL_START_BUDGET_MS = 540_000;
+
+function describeFatalStatus(status: number): string {
+  if (status === 410)
+    return 'the model has been retired; probe a replacement (/api/cron/llm-probe)';
+  if (status === 404) return 'the model is not served to this key; probe a replacement';
+  return 'the NIM API key was rejected';
+}
+
 // ---------------------------------------------------------------------------
 // Phase 30 D-04 (SIMPLIFY-01) — incremental flush retired. The Pro 800s
 // ceiling makes the prior Hobby-era 300s-budget crash-protection rationale
@@ -188,20 +207,27 @@ async function mergeAndPersistLlmEntities(
   newlyEnriched: ConflictEventEntity[],
   llmCachedRef: { data: ConflictEventEntity[] } | null,
   key: string,
-): Promise<{ writtenCount: number; total: number }> {
+): Promise<
+  { writtenCount: number; total: number; merged: ConflictEventEntity[] } & (
+    | { ok: true }
+    | { ok: false; error: string }
+  )
+> {
   const llmMergeMap = new Map<string, ConflictEventEntity>();
   if (llmCachedRef?.data) {
     for (const e of llmCachedRef.data) llmMergeMap.set(e.id, e);
   }
   for (const e of newlyEnriched) llmMergeMap.set(e.id, e);
   const llmMerged = Array.from(llmMergeMap.values());
-  await cacheSetSafe(key, llmMerged, LLM_TERMINAL_TTL_SEC);
+  const written = await cacheSetReported(key, llmMerged, LLM_TERMINAL_TTL_SEC);
   saveDevLLMCacheV2(llmMerged);
-  log.info(
-    { count: newlyEnriched.length, total: llmMerged.length },
-    'LLM: persisted enriched events to terminal cache (Plan 01 helper)',
-  );
-  return { writtenCount: newlyEnriched.length, total: llmMerged.length };
+  const counts = { writtenCount: newlyEnriched.length, total: llmMerged.length };
+  if (!written.ok) {
+    log.error({ ...counts, err: written.error }, 'LLM: write to the enriched cache FAILED');
+    return { ...counts, merged: llmMerged, ok: false, error: written.error };
+  }
+  log.info(counts, 'LLM: persisted enriched events');
+  return { ...counts, merged: llmMerged, ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +475,7 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
         }
         const newGroups =
           cachedLlmKeys.size > 0
-            ? groups.filter((g) => !cachedLlmKeys.has(`llm-v3-${g.key}`))
+            ? groups.filter((g) => !cachedLlmKeys.has(enrichedIdForGroup(g.key)))
             : groups;
 
         updateProgress({ newGroups: newGroups.length });
@@ -493,30 +519,161 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
         // consumed on each cycle contains the highest-impact events.
         const prioritizedGroups = await prioritizeBySeverity(newGroups);
 
-        // v3 BATCH_SIZE=2 (the v1 BATCH_SIZE=8 path is gone post-Phase-29).
-        const effectiveBatchSize = BATCH_SIZE_ACTIVE;
-        updateProgress({
-          stage: 'llm-processing',
-          totalBatches: Math.ceil(prioritizedGroups.length / effectiveBatchSize),
-        });
-
-        const extractResult = await processEventGroupsV3(
-          prioritizedGroups,
-          async (completed, total) => {
-            updateProgress({ completedBatches: completed, totalBatches: total });
-            // Phase 30 D-04 (SIMPLIFY-01): incremental flush retired. Terminal
-            // write at the mergeAndPersistLlmEntities call below is canonical.
-            // Phase 35 D-12 (SIMPLIFY-02): writePartialCache was deleted from the
-            // v3 extractor; there is no partial-cache write anywhere.
-          },
+        // The run works in waves — extract, geocode, persist — instead of one
+        // pass with a single write at the end. A cold corpus (~1,100 groups)
+        // does not fit in the 800 s function limit; with a terminal-only write
+        // a killed run persisted nothing and the next night started cold
+        // again. Now every wave lands in `events:llm:v3`, the next run's diff
+        // skips what is already there, and the corpus fills over a few runs,
+        // highest severity first.
+        //
+        // Geocoding is sequential (Nominatim, 1 req/s) and is the slow half, so
+        // wave N+1's LLM calls overlap wave N's geocoding. At most one wave may
+        // be waiting for the geocoder: LLM output that is never geocoded is
+        // wasted quota.
+        const waveSize = Math.max(
+          BATCH_SIZE_ACTIVE,
+          env.LLM_V3_CONCURRENCY * BATCH_SIZE_ACTIVE * 2,
         );
+        const llmDeadlineMs = cronStart + LLM_PHASE_BUDGET_MS;
+        const geocodeDeadlineMs = cronStart + GEOCODE_PHASE_BUDGET_MS;
+        const totalBatchesAll = Math.ceil(prioritizedGroups.length / BATCH_SIZE_ACTIVE);
+        updateProgress({ stage: 'llm-processing', totalBatches: totalBatchesAll });
 
-        if (!extractResult.events || extractResult.events.length === 0) {
-          log.warn('LLM processing returned null — raw GDELT serving continues');
-          runOutcome = 'error'; // GA-2 branch 3: null extraction → error
+        let cacheRef: { data: ConflictEventEntity[] } | null = llmCachedRef;
+        let batchesDone = 0;
+        let enrichedTotal = 0;
+        let geocodedTotal = 0;
+        let persistedTotal = 0;
+        let writeError: string | null = null;
+        let extractError: string | null = null;
+        let fatalStatus: number | undefined;
+        const provenanceCounts: Partial<Record<GeocodeProvenance, number>> = {};
+        let suspectCount = 0;
+
+        // GDELT-MATCH-03/04 — OSINT clusters (`news:feed`) for the strict
+        // three-gate corroboration boost. Best-effort: a missing read yields a
+        // tier+precision composite with zero corroboration — it never blocks
+        // the write and never mutates the raw corpus (D-07).
+        let newsClusters: NewsCluster[] | undefined;
+        try {
+          const newsCache = await cacheGetSafe<NewsCluster[]>('news:feed', 0);
+          if (newsCache?.data) newsClusters = newsCache.data;
+        } catch {
+          /* best-effort — corroboration boost defaults to 0 */
+        }
+
+        const geocodeAndPersist = async (
+          wave: EventGroup[],
+          extract: Awaited<ReturnType<typeof processEventGroupsV3>>,
+        ): Promise<void> => {
+          const events = extract.events ?? [];
+          if (events.length === 0) return;
+          const groupsByKey = new Map(wave.map((g) => [g.key, g] as const));
+          const geocoded = await geocodeEnrichedEventsV3(
+            events,
+            groupsByKey,
+            extract.matchedNewsByGroup,
+            extract.bellingcatByGroup,
+            (completed) => {
+              updateProgress({ completedGeocodes: geocodedTotal + completed });
+            },
+            { deadlineMs: geocodeDeadlineMs },
+          );
+          geocodedTotal += geocoded.length;
+          for (const e of geocoded) {
+            provenanceCounts[e.geocodeProvenance] =
+              (provenanceCounts[e.geocodeProvenance] ?? 0) + 1;
+            if (e.suspect) suspectCount++;
+          }
+          updateProgress({ provenanceCounts, suspectCount, completedGeocodes: geocodedTotal });
+          if (geocoded.length === 0) return;
+
+          const entities = enrichedV3ToEntities(geocoded, wave, newsClusters);
+          const written = await mergeAndPersistLlmEntities(
+            entities,
+            cacheRef,
+            LLM_EVENTS_KEY_ACTIVE,
+          );
+          cacheRef = { data: written.merged };
+          if (written.ok) persistedTotal += written.writtenCount;
+          else writeError = written.error;
+        };
+
+        // The geocode task is only awaited after the next wave's LLM phase, so
+        // it must never reject in the meantime (that would be an unhandled
+        // rejection). A wave that fails here is simply not persisted.
+        const geocodeAndPersistSafe = async (
+          wave: EventGroup[],
+          extract: Awaited<ReturnType<typeof processEventGroupsV3>>,
+        ): Promise<void> => {
+          try {
+            await geocodeAndPersist(wave, extract);
+          } catch (err) {
+            writeError = err instanceof Error ? err.message : String(err);
+            log.error({ err: writeError }, 'LLM: geocode/persist failed for a wave');
+          }
+        };
+
+        let geocodeChain: Promise<void> = Promise.resolve();
+        for (let i = 0; i < prioritizedGroups.length; i += waveSize) {
+          if (Date.now() >= llmDeadlineMs) {
+            log.info(
+              { processedGroups: i, totalGroups: prioritizedGroups.length },
+              'LLM: phase budget spent — remaining groups are left for the next run',
+            );
+            break;
+          }
+          const wave = prioritizedGroups.slice(i, i + waveSize);
+          const doneBefore = batchesDone;
+          let extract: Awaited<ReturnType<typeof processEventGroupsV3>>;
+          try {
+            extract = await processEventGroupsV3(wave, (completed) => {
+              updateProgress({
+                completedBatches: doneBefore + completed,
+                totalBatches: totalBatchesAll,
+              });
+            });
+          } catch (waveErr) {
+            // Stop here, but fall through to the drain below: the previous
+            // wave may still be geocoding, and its write must land before the
+            // run record closes and the function is frozen.
+            extractError = waveErr instanceof Error ? waveErr.message : String(waveErr);
+            log.error(
+              { err: extractError, wave: i / waveSize },
+              'LLM: a wave threw — ending the run',
+            );
+            break;
+          }
+          batchesDone += Math.ceil(wave.length / BATCH_SIZE_ACTIVE);
+          enrichedTotal += extract.events?.length ?? 0;
+          updateProgress({ enrichedCount: enrichedTotal, totalGeocodes: enrichedTotal });
+
+          // Let the previous wave finish geocoding before queueing this one.
+          await geocodeChain;
+          geocodeChain = geocodeAndPersistSafe(wave, extract);
+
+          if (extract.fatalStatus !== undefined) {
+            fatalStatus = extract.fatalStatus;
+            break;
+          }
+        }
+        updateProgress({ stage: 'geocoding' });
+        await geocodeChain;
+
+        if (fatalStatus !== undefined || persistedTotal === 0) {
+          const errorMessage =
+            fatalStatus !== undefined
+              ? `LLM provider answered HTTP ${fatalStatus} — ${describeFatalStatus(fatalStatus)}`
+              : (writeError ?? extractError ?? 'LLM returned null for all batches');
+          log.warn(
+            { fatalStatus, writeError, enrichedTotal, persistedTotal },
+            'LLM run produced nothing new — raw GDELT serving continues',
+          );
+          runOutcome = 'error'; // GA-2 branch 3: nothing persisted → error
           updateProgress({
             stage: 'error',
-            errorMessage: 'LLM returned null for all batches',
+            errorMessage,
             completedAt: Date.now(),
             durationMs: Date.now() - (llmProgress.startedAt ?? Date.now()),
           });
@@ -528,76 +685,31 @@ export async function runRefreshExtraction(opts: RunRefreshOpts): Promise<RunRef
           return;
         }
 
-        updateProgress({
-          stage: 'geocoding',
-          enrichedCount: extractResult.events.length,
-          totalGeocodes: extractResult.events.length,
-        });
-
-        // geocodeEnrichedEventsV3 takes the v3-native signature: a flat events
-        // array + a groupsByKey map + the per-group news/bellingcat maps
-        // threaded straight from the extractor run (no tagged-shape wrapper —
-        // the Phase 38 LLM-PURGE-01 stub barrel that wrapped this was deleted).
-        const groupsByKey = new Map(prioritizedGroups.map((g) => [g.key, g] as const));
-        const geocodedEvents = await geocodeEnrichedEventsV3(
-          extractResult.events,
-          groupsByKey,
-          extractResult.matchedNewsByGroup,
-          extractResult.bellingcatByGroup,
-          (completed, total) => {
-            updateProgress({ completedGeocodes: completed, totalGeocodes: total });
-          },
-        );
-        const provenanceCounts: Partial<Record<GeocodeProvenance, number>> = {};
-        let suspectCount = 0;
-        for (const e of geocodedEvents) {
-          provenanceCounts[e.geocodeProvenance] = (provenanceCounts[e.geocodeProvenance] ?? 0) + 1;
-          if (e.suspect) suspectCount++;
-        }
-        updateProgress({ provenanceCounts, suspectCount });
-
-        // Phase 39 SC39-3 (WR-04) — capture the eval result and stamp it onto
-        // the live progress singleton so `buildRunHistoryEntry` snapshots THIS
-        // run's actual score into the run record (and the FlightRecorder eval
-        // pill renders a real value). `runEval()` already calls
-        // updateProgress({ evalScore }) internally, but we re-stamp explicitly
-        // here so the run-record write does not depend on that side effect — a
-        // future refactor of runEval that drops the internal write would
-        // otherwise silently blank the eval pill again. The shape is the real
-        // harness shape (`{ within5km, within20km, within100km, total,
-        // actorMatchRate }`); the client renders within20km/total (WR-05).
-        try {
-          const evalScore = await runEval();
-          updateProgress({ evalScore });
-          log.info({ evalScore, schemaVersion: 'v3' }, 'eval harness completed');
-        } catch (evalErr) {
-          log.warn({ err: evalErr }, 'eval harness threw; continuing pipeline');
+        // The eval harness runs after the data is safe, and only when there is
+        // time left: it is a measurement, and it used to stand between a
+        // finished extraction and its one and only write. `runEval()` stamps
+        // `evalScore` on the progress singleton itself; re-stamping here keeps
+        // the run record independent of that side effect.
+        if (Date.now() < cronStart + EVAL_START_BUDGET_MS) {
+          try {
+            const evalScore = await runEval();
+            updateProgress({ evalScore });
+            log.info({ evalScore, schemaVersion: 'v3' }, 'eval harness completed');
+          } catch (evalErr) {
+            log.warn({ err: evalErr }, 'eval harness threw; continuing pipeline');
+          }
         }
 
-        // GDELT-MATCH-03/04 — read the OSINT clusters (`news:feed`) so the
-        // strict three-gate corroboration boost can be folded into each
-        // entity's additive compositeScore. Best-effort: a missing/failed read
-        // simply yields a tier+precision composite with zero corroboration —
-        // never blocks the write, never mutates the raw corpus (D-07).
-        let newsClusters: NewsCluster[] | undefined;
-        try {
-          const newsCache = await cacheGetSafe<NewsCluster[]>('news:feed', 0);
-          if (newsCache?.data) newsClusters = newsCache.data;
-        } catch {
-          /* best-effort — corroboration boost defaults to 0 */
+        runOutcome = 'completed'; // GA-2 branch 4: something was persisted → completed
+        // A run can persist most of its waves and still lose one (a failed
+        // write, a wave that threw). It is `completed`, and it says what it lost.
+        const partialFailure = writeError ?? extractError;
+        if (partialFailure) {
+          log.warn({ partialFailure, persistedTotal }, 'LLM run completed with a lost wave');
         }
-
-        const llmEntities = enrichedV3ToEntities(geocodedEvents, prioritizedGroups, newsClusters);
-
-        // Phase 30 D-04 (SIMPLIFY-01) — sole / terminal write of the
-        // canonical `events:llm:v3` key for this cron run. The Phase 28.2.6
-        // Plan 01 Task 4b periodic-flush callsite (formerly inside the
-        // onBatchComplete callback above) was retired here.
-        await mergeAndPersistLlmEntities(llmEntities, llmCachedRef, LLM_EVENTS_KEY_ACTIVE);
-
-        runOutcome = 'completed'; // GA-2 branch 4: full success → completed
         updateProgress({
           stage: 'done',
+          ...(partialFailure ? { errorMessage: `partial: ${partialFailure}` } : {}),
           completedAt: Date.now(),
           durationMs: Date.now() - (llmProgress.startedAt ?? Date.now()),
         });
@@ -758,7 +870,7 @@ export function enrichedV3ToEntities(
 
     results.push({
       ...template,
-      id: `llm-v3-${enriched.groupKey}`,
+      id: enrichedIdForGroup(enriched.groupKey),
       lat: enriched.resolvedLat,
       lng: enriched.resolvedLng,
       type: enriched.type,

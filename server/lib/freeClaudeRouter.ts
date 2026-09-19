@@ -90,9 +90,15 @@ export type RouterErrorBucket =
 // Constants
 // ---------------------------------------------------------------------------
 
-const NVIDIA_NIM_BASE = 'https://integrate.api.nvidia.com/v1';
+export const NVIDIA_NIM_BASE = 'https://integrate.api.nvidia.com/v1';
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const LLM_TIMEOUT_MS = 120_000;
+// Per-request timeout. The production model answers a batch in ~15 s when
+// idle, but under a sustained run its tail reaches 45-90 s. Measured
+// 2026-09-19: at 45 s (with one retry) 23 of ~90 attempts were cut off and 6
+// batches lost; at 120 s, 1 batch in 64. 90 s keeps the slow calls and still
+// bounds how long one hung connection can hold up a wave. A timeout is not
+// retried: the batch's groups stay out of the cache, so the next run takes them.
+const LLM_TIMEOUT_MS = 90_000;
 
 // Phase 30 D-02 sanity-check tune (Run 1 baseline — Path B, no 429s):
 //   - Run 1 measured `throttleWindowMs.path = "B"` (NIM did NOT 429 during
@@ -128,34 +134,28 @@ const LLM_TIMEOUT_MS = 120_000;
 // Operator rollback (env override is NOT available — these are constants;
 // in-incident reversion requires `git revert` of this commit):
 //   RETRY_ATTEMPTS = 2; BACKOFF_MS = [1000, 4000]; JITTER_MS = 250.
+// 401/403 = key rejected, 404 = model not served to this key, 410 = model retired.
+const FATAL_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 410]);
 const RETRY_ATTEMPTS = 3;
 const BACKOFF_MS = [2000, 8000, 32_000] as const;
 const JITTER_MS = 500;
-// Phase 27.4.4 D-01 — bake-off winner re-confirmed via combo path
-// (operator-approved 2026-04-28 against 27.4.4-01-BAKEOFF.md). qwen/qwen3.5-397b-a17b
-// remains the v3 primary after the 4-candidate 20-event preflight at
-// 27.4.4-PREFLIGHT-CHARACTERIZATION.md showed:
-//   - qwen: 16/20 within20km (0.80) — best of the 4 LIVE candidates.
-//   - llama: 15/20 (0.75), gen-duration p95=564.4s (2.1× worse than qwen's 264.9s).
-//   - nemotron: 0/20 — schema-fails despite envelope-shape PROMPT_OVERRIDES.
-//   - glm: 0/20 — 400 status on every call (NIM catalog drift or extra_body rejection).
-// 0/4 cleared the D-03 dual hard floor (within20km ≥ 0.890 AND p95 ≤ 30s).
-// Combo path means qwen + V3_ADAPTIVE_BATCH=true at Gate B (Plan 02).
+// Production model. NIM retires free-tier models on a schedule: a retired id
+// answers HTTP 410 on every call, and most ids in NIM's public catalog are not
+// served to a free-tier key at all (404). Do not pick a replacement from the
+// catalog — probe it: `GET /api/cron/llm-probe?models=<id>,<id>` sends one
+// production-shaped batch per candidate and reports status, latency and schema
+// validity (docs/OPERATIONS.md §3.3).
 //
-// In-incident reversion: temporarily set V3_PRIMARY_MODEL=<NVIDIA_NIM_FALLBACK_MODEL>.
-// In 27.4.4 the fallback is itself qwen (no other viable NIM candidate); fall-back
-// becomes meaningful again when a future phase re-baselines and a different model
-// passes.
+// History: `qwen/qwen3.5-397b-a17b` (bake-off winner, 2026-04) was retired on
+// 2026-07-27 and the pipeline wrote nothing for eight weeks. On 2026-09-19 a
+// probe of 20 candidates found one usable model: gemma-4-31b-it — 8/8
+// schema-valid at 8 concurrent calls, ~15 s per 2-group batch. The GLM, Kimi,
+// DeepSeek and gpt-oss reasoning models exceeded 90 s; nemotron-super
+// truncated at 2048 tokens.
 //
-// Per-candidate baselines persisted at events:llm-eval-baseline:v3:<sanitized-model-id> (90d TTL).
-// See .planning/phases/27.4.4-v3-latency-remediation-and-cutover/27.4.4-01-BAKEOFF.md.
-const NVIDIA_NIM_DEFAULT_MODEL = process.env.V3_PRIMARY_MODEL ?? 'qwen/qwen3.5-397b-a17b';
-
-// Phase 27.4.4 D-01 in-incident reversion handle. 27.4.3's qwen incumbent is the
-// only viable NIM candidate after 27.4.4's bake-off — fallback is itself qwen
-// for now. A future phase that re-baselines should update this to the next-best
-// LIVE candidate. Set V3_PRIMARY_MODEL=<this value> to revert without code edit.
-export const NVIDIA_NIM_FALLBACK_MODEL = 'qwen/qwen3.5-397b-a17b';
+// `V3_PRIMARY_MODEL` overrides this without a code change (leave it unset in
+// production once the default is live).
+export const NVIDIA_NIM_DEFAULT_MODEL = process.env.V3_PRIMARY_MODEL ?? 'google/gemma-4-31b-it';
 
 // D-09: OpenRouter free-tier fallback model.
 export const OPENROUTER_DEFAULT_MODEL = 'meta-llama/llama-3.3-70b-instruct:free';
@@ -178,10 +178,8 @@ const MAX_TOKENS_PER_MODEL: Record<string, number> = {
   // showed ~89% truncation rate (50 v3:malformed DLQ in 7 batches) — the
   // 20-event preflight characterization underestimated production hierarchy
   // verbosity. 2048 keeps a 5× safety margin against the 4096 default.
-  'qwen/qwen3.5-397b-a17b': 2048,
-  'meta/llama-3.3-70b-instruct': 380, // p99 315 + 20% buffer
-  'nvidia/nemotron-3-super-120b-a12b': 1240, // p99 1031 + 20% buffer (verbose, schema-fails)
-  'z-ai/glm4.7': 1024, // conservative — no traceable records (NIM 400s)
+  // ~590 tokens observed per 2-group batch; 2048 leaves room for LLM_BATCH_SIZE up to ~6.
+  'google/gemma-4-31b-it': 2048,
 };
 const MAX_TOKENS_DEFAULT = 4096;
 
@@ -210,6 +208,25 @@ class RollingWindow {
 
   consume(): void {
     this.timestamps.push(Date.now());
+  }
+
+  /**
+   * Wait for a free slot, then take it. Callers block instead of being turned
+   * away: with a single provider there is nowhere to fall through to, so a
+   * refused call is a lost batch, and a full window used to drain the rest of
+   * a run as instant nulls.
+   */
+  async acquire(): Promise<void> {
+    for (;;) {
+      const now = Date.now();
+      this.evict(now);
+      if (this.timestamps.length < this.cap) {
+        this.timestamps.push(now);
+        return;
+      }
+      const oldest = this.timestamps[0] ?? now;
+      await new Promise((r) => setTimeout(r, Math.max(50, oldest + this.windowMs - now)));
+    }
   }
 
   headroom(): { used: number; cap: number } {
@@ -243,6 +260,10 @@ function getNvidiaNimClient(): OpenAI | null {
     apiKey: env.NVIDIA_NIM_API_KEY,
     baseURL: NVIDIA_NIM_BASE,
     timeout: LLM_TIMEOUT_MS,
+    // The router owns retries. The SDK's default 2 hidden retries tripled the
+    // real request rate behind the 40/min window and stretched a failing call
+    // past the batch watchdog.
+    maxRetries: 0,
   });
 }
 
@@ -252,6 +273,7 @@ function getOpenRouterClient(): OpenAI | null {
     apiKey: env.OPENROUTER_API_KEY,
     baseURL: OPENROUTER_BASE,
     timeout: LLM_TIMEOUT_MS,
+    maxRetries: 0,
   });
 }
 
@@ -362,6 +384,12 @@ export async function callLLM(
   content: string | null;
   routing: RoutingDecision[];
   finishReason?: RouterFinishReason;
+  /**
+   * Set when the provider answered 401/403/404/410: the key is rejected or the
+   * model is not served. No retry can succeed, so the caller should stop the
+   * run and say why instead of grinding through every batch.
+   */
+  fatalStatus?: number;
 }> {
   const log = logger.child({ component: 'freeClaudeRouter' });
   const decisions: RoutingDecision[] = [];
@@ -389,6 +417,11 @@ export async function callLLM(
   const providers = includeOpenRouter
     ? allProviders
     : allProviders.filter((p) => p.name !== 'openrouter');
+  // A breaker only helps when there is somewhere else to send the call. With a
+  // single live provider a tripped breaker turned every remaining batch of the
+  // run into an instant null for five minutes.
+  const hasFallThrough = providers.filter((p) => p.client).length > 1;
+  let fatalStatus: number | undefined;
 
   for (let idx = 0; idx < providers.length; idx++) {
     const p = providers[idx];
@@ -397,7 +430,7 @@ export async function callLLM(
     const prevName = idx > 0 ? providers[idx - 1]?.name : null;
     /**
      * Build the routing reason for the *current* provider when it is BYPASSED
-     * by a gate (no_client / breaker / rate_limit_window). Phase 38 LLM-PURGE-08
+     * by a gate (no_client / breaker). Phase 38 LLM-PURGE-08
      * removed the OpenRouter daily-cap gate; `daily_cap` survives only as a
      * legacy skipReason union member.
      *   - For the primary, encode the bypass cause as `skipped:<suffix>` so
@@ -418,20 +451,11 @@ export async function callLLM(
       });
       continue;
     }
-    if (!isAvailable(p.name as Provider)) {
+    if (hasFallThrough && !isAvailable(p.name as Provider)) {
       decisions.push({
         provider: p.name,
         model: p.model,
         reason: buildReason('breaker'),
-        timestamp: Date.now(),
-      });
-      continue;
-    }
-    if (p.name === 'nvidia_nim' && !nvidiaNimWindow.canRequest()) {
-      decisions.push({
-        provider: p.name,
-        model: p.model,
-        reason: buildReason('rate_limit_window'),
         timestamp: Date.now(),
       });
       continue;
@@ -455,9 +479,11 @@ export async function callLLM(
     // is a raw failure counter, not a breaker signal.
     let callFailed = false;
     for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-      const t0 = Date.now();
+      let t0 = Date.now();
       try {
-        if (p.name === 'nvidia_nim') nvidiaNimWindow.consume();
+        // Blocks until the 40/min window has room (see RollingWindow.acquire).
+        if (p.name === 'nvidia_nim') await nvidiaNimWindow.acquire();
+        t0 = Date.now(); // latency measures the provider, not the wait for a slot
 
         const res = await p.client.chat.completions.create({
           model: p.model,
@@ -591,6 +617,8 @@ export async function callLLM(
           },
           'router attempt failed',
         );
+        const status = (err as { status?: unknown }).status;
+        if (typeof status === 'number' && FATAL_STATUSES.has(status)) fatalStatus = status;
         if (bucket === 'rate_limit' && attempt < RETRY_ATTEMPTS - 1) {
           const base: number = BACKOFF_MS[attempt] ?? BACKOFF_MS[0] ?? 1000;
           await sleepWithJitter(base);
@@ -609,8 +637,8 @@ export async function callLLM(
     }
   }
 
-  log.warn('all free providers unavailable — returning null content');
-  return { content: null, routing: decisions };
+  log.warn({ fatalStatus }, 'all free providers unavailable — returning null content');
+  return { content: null, routing: decisions, fatalStatus };
 }
 
 // ---------------------------------------------------------------------------
