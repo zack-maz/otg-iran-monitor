@@ -192,7 +192,11 @@ vi.mock('../../adapters/llm-provider.js', () => ({
   callLLM: vi.fn(async () => null),
   isLLMConfigured: (...args: unknown[]) => mockIsLLMConfigured(...(args as [])),
 }));
-vi.mock('../../lib/eventGrouping.js', () => ({
+// Only the route's own `groupGdeltRows` call (/llm-replay) is mocked.
+// `fillWithRawEvents` stays real — it groups through the module's internal
+// reference — so GET /api/events is tested against the real top-up.
+vi.mock('../../lib/eventGrouping.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/eventGrouping.js')>()),
   groupGdeltRows: (...args: unknown[]) => mockGroupGdeltRows(...(args as [])),
 }));
 // Phase 38 LLM-PURGE-01 — the `llmEventExtractor.js` stub barrel was deleted;
@@ -532,6 +536,14 @@ describe('Events Route (Redis accumulator)', () => {
     expect(res.status).toBe(404);
   });
 
+  // A route registered behind a NODE_ENV check is simply absent in production;
+  // the probe exists to be called there.
+  it('GET /api/cron/llm-probe is mounted (answers, whatever the answer, rather than 404)', async () => {
+    const res = await fetch(`${baseUrl}/api/cron/llm-probe`);
+    expect(res.status).not.toBe(404);
+    expect([200, 401]).toContain(res.status);
+  });
+
   it('has no module-level backfill code (no fs access, no GDELT fetch at import time)', async () => {
     // The fact we can import the module without any fs errors or GDELT calls
     // proves there are no module-level side effects.
@@ -746,22 +758,57 @@ describe('Events Route (Redis accumulator)', () => {
       },
     });
 
-    it('serves fresh LLM cache directly without triggering LLM processing', async () => {
-      // Pre-populate v3 LLM cache with fresh data
+    it('fresh enriched cache + cold raw cache: refreshes raw GDELT so the response can be topped up, and still serves fresh', async () => {
       redisStore.set('events:llm:v3', {
         data: [llmEvent],
         fetchedAt: Date.now(), // fresh
       });
+      mockFetchEvents.mockResolvedValue([eventA]);
 
       const res = await fetch(`${baseUrl}/api/events`);
       const body = await res.json();
 
       expect(res.ok).toBe(true);
       expect(body.stale).toBe(false);
-      expect(body.data).toHaveLength(1);
-      expect(body.data[0].id).toBe('llm-enriched-1');
+      // The raw cache was cold, so it is refreshed rather than skipped...
+      expect(mockFetchEvents).toHaveBeenCalledTimes(1);
+      expect(redisStore.has('events:gdelt')).toBe(true);
+      // ...and the enriched event is served with the uncovered raw row.
+      expect(body.data.map((e: ConflictEventEntity) => e.id)).toEqual([
+        'llm-enriched-1',
+        'gdelt-A',
+      ]);
       expect(body.data[0].data.llmProcessed).toBe(true);
-      // Should NOT call fetchEvents or LLM pipeline
+      expect(mockProcessEventGroupsV3).not.toHaveBeenCalled();
+    });
+
+    it('enriched cache, no raw cache, GDELT down: serves the enriched events instead of a 502', async () => {
+      // The map never goes blank: with nothing to top up from and the upstream
+      // failing, the enriched cache alone is still a servable answer.
+      redisStore.set('events:llm:v3', { data: [llmEvent], fetchedAt: Date.now() });
+      mockFetchEvents.mockRejectedValue(new Error('GDELT down'));
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(body.stale).toBe(true);
+      expect(body.data.map((e: { id: string }) => e.id)).toEqual(['llm-enriched-1']);
+    });
+
+    it('fresh enriched cache + fresh raw cache: served from cache with no upstream fetch', async () => {
+      redisStore.set('events:llm:v3', { data: [llmEvent], fetchedAt: Date.now() });
+      redisStore.set('events:gdelt', { data: [eventA], fetchedAt: Date.now() });
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(res.ok).toBe(true);
+      expect(body.stale).toBe(false);
+      expect(body.data.map((e: ConflictEventEntity) => e.id)).toEqual([
+        'llm-enriched-1',
+        'gdelt-A',
+      ]);
       expect(mockFetchEvents).not.toHaveBeenCalled();
       expect(mockProcessEventGroupsV3).not.toHaveBeenCalled();
     });
@@ -802,13 +849,9 @@ describe('Events Route (Redis accumulator)', () => {
       expect(mockGeocodeEnrichedEvents).not.toHaveBeenCalled();
     });
 
-    it('serves stale LLM cache when cooldown has NOT expired', async () => {
+    it('a stale enriched cache is still served, flagged stale, and never re-extracted on the read path', async () => {
       mockIsLLMConfigured.mockReturnValue(true);
       mockFetchEvents.mockResolvedValue([eventA]);
-
-      // Set LLM cooldown timestamp (recently processed)
-      rawRedisStore.set('events:llm-process-ts', Date.now());
-      // Stale v3 LLM cache
       redisStore.set('events:llm:v3', {
         data: [llmEvent],
         fetchedAt: Date.now() - 901_000, // stale
@@ -818,10 +861,13 @@ describe('Events Route (Redis accumulator)', () => {
       const body = await res.json();
 
       expect(res.ok).toBe(true);
-      // Should serve the stale LLM cache
-      expect(body.data.some((e: ConflictEventEntity) => e.data.llmProcessed === true)).toBe(true);
-      // Should NOT trigger LLM processing
+      expect(body.stale).toBe(true);
+      expect(body.data.map((e: ConflictEventEntity) => e.id)).toEqual([
+        'llm-enriched-1',
+        'gdelt-A',
+      ]);
       expect(mockProcessEventGroupsV3).not.toHaveBeenCalled();
+      expect(mockGeocodeEnrichedEvents).not.toHaveBeenCalled();
     });
 
     it('falls back to raw GDELT when LLM processing fails (returns null)', async () => {
@@ -933,6 +979,136 @@ describe('Events Route (Redis accumulator)', () => {
       expect(body.data.length).toBeGreaterThanOrEqual(1);
       // CRITICAL: the route must NOT trigger extraction.
       expect(mockProcessEventGroupsV3).not.toHaveBeenCalled();
+    });
+  });
+
+  // The pipeline fills `events:llm:v3` a wave at a time over several runs.
+  // Serving the enriched cache alone would shrink the map to the first wave,
+  // so the route tops it up with the raw rows of every group that has no
+  // enriched event yet — and only those: a covered group's raw rows would
+  // draw the same event twice.
+  describe('enriched cache topped up with the raw rows of uncovered groups', () => {
+    const now = Date.now();
+    const raw = (id: string, overrides: Partial<ConflictEventEntity> = {}) =>
+      makeEvent({ id, timestamp: now, ...overrides });
+    // Covered group: two Baghdad rows, same day, same CAMEO root, ~7 km apart.
+    const baghdad1 = raw('gdelt-101');
+    const baghdad2 = raw('gdelt-102', {
+      lat: 33.35,
+      lng: 44.45,
+      data: { ...makeEvent().data, actor1: 'ISR', source: 'https://example.com/other' },
+    });
+    // Uncovered groups: a Tehran row (too far to merge) and a Baghdad row the day before.
+    const tehran = raw('gdelt-201', { lat: 35.7, lng: 51.4 });
+    const dayBefore = raw('gdelt-301', { timestamp: now - 86_400_000 });
+    const rawCorpus = [baghdad1, baghdad2, tehran, dayBefore];
+
+    /** Enriched entity for the group that holds `memberId`, keyed the way the pipeline keys it. */
+    async function enrichedFor(memberId: string): Promise<ConflictEventEntity> {
+      const real = await vi.importActual<typeof import('../../lib/eventGrouping.js')>(
+        '../../lib/eventGrouping.js',
+      );
+      const group = real
+        .groupGdeltRows(real.dedupHighConfidence(rawCorpus))
+        .find((g) => g.entities.some((e) => e.id === memberId));
+      if (!group) throw new Error(`no group holds ${memberId}`);
+      return makeEvent({
+        id: real.enrichedIdForGroup(group.key),
+        timestamp: now,
+        label: 'Baghdad: enriched',
+        data: { ...makeEvent().data, llmProcessed: true, summary: 'enriched' },
+      });
+    }
+
+    const ids = (body: { data: ConflictEventEntity[] }) => body.data.map((e) => e.id).sort();
+
+    function expectNoExtraction() {
+      expect(mockProcessEventGroupsV3).not.toHaveBeenCalled();
+      expect(mockGeocodeEnrichedEvents).not.toHaveBeenCalled();
+      expect(mockRunEval).not.toHaveBeenCalled();
+    }
+
+    it('the fixture groups as intended: both Baghdad rows share one group', async () => {
+      const real = await vi.importActual<typeof import('../../lib/eventGrouping.js')>(
+        '../../lib/eventGrouping.js',
+      );
+      const groups = real.groupGdeltRows(real.dedupHighConfidence(rawCorpus));
+      const members = groups.map((g) => g.entities.map((e) => e.id).sort()).sort();
+      expect(members).toEqual([['gdelt-101', 'gdelt-102'], ['gdelt-201'], ['gdelt-301']]);
+    });
+
+    it('fresh partial enriched cache + fresh raw cache: enriched events plus only the uncovered raw rows', async () => {
+      const enriched = await enrichedFor('gdelt-101');
+      redisStore.set('events:llm:v3', { data: [enriched], fetchedAt: Date.now() });
+      redisStore.set('events:gdelt', { data: rawCorpus, fetchedAt: Date.now() });
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(res.ok).toBe(true);
+      expect(body.stale).toBe(false);
+      expect(ids(body)).toEqual([enriched.id, 'gdelt-201', 'gdelt-301'].sort());
+      // The covered group's raw rows are gone — they would draw the event twice.
+      expect(ids(body)).not.toContain('gdelt-101');
+      expect(ids(body)).not.toContain('gdelt-102');
+      expect(mockFetchEvents).not.toHaveBeenCalled();
+      expectNoExtraction();
+    });
+
+    it('stale partial enriched cache + fresh raw cache: same top-up, flagged stale', async () => {
+      const enriched = await enrichedFor('gdelt-101');
+      redisStore.set('events:llm:v3', { data: [enriched], fetchedAt: Date.now() - 901_000 });
+      redisStore.set('events:gdelt', { data: rawCorpus, fetchedAt: Date.now() });
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(body.stale).toBe(true);
+      expect(ids(body)).toEqual([enriched.id, 'gdelt-201', 'gdelt-301'].sort());
+      expect(mockFetchEvents).not.toHaveBeenCalled();
+      expectNoExtraction();
+    });
+
+    it('enriched cache + cold raw cache: still serves, topped up from the refreshed raw rows', async () => {
+      const enriched = await enrichedFor('gdelt-101');
+      redisStore.set('events:llm:v3', { data: [enriched], fetchedAt: Date.now() });
+      mockFetchEvents.mockResolvedValue(rawCorpus);
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(res.ok).toBe(true);
+      expect(body.stale).toBe(false);
+      expect(mockFetchEvents).toHaveBeenCalledTimes(1);
+      expect(ids(body)).toEqual([enriched.id, 'gdelt-201', 'gdelt-301'].sort());
+      expectNoExtraction();
+    });
+
+    it('GDELT down with a stale raw cache: the enriched events plus the uncovered stale raw rows, flagged stale', async () => {
+      const enriched = await enrichedFor('gdelt-101');
+      redisStore.set('events:llm:v3', { data: [enriched], fetchedAt: Date.now() });
+      redisStore.set('events:gdelt', { data: rawCorpus, fetchedAt: Date.now() - 3_600_000 * 24 });
+      mockFetchEvents.mockRejectedValue(new Error('gdelt down'));
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(res.ok).toBe(true);
+      expect(body.stale).toBe(true);
+      expect(ids(body)).toEqual([enriched.id, 'gdelt-201', 'gdelt-301'].sort());
+      expectNoExtraction();
+    });
+
+    it('an enriched cache that covers every group serves no raw rows at all', async () => {
+      const all = await Promise.all(['gdelt-101', 'gdelt-201', 'gdelt-301'].map(enrichedFor));
+      redisStore.set('events:llm:v3', { data: all, fetchedAt: Date.now() });
+      redisStore.set('events:gdelt', { data: rawCorpus, fetchedAt: Date.now() });
+
+      const res = await fetch(`${baseUrl}/api/events`);
+      const body = await res.json();
+
+      expect(ids(body)).toEqual(all.map((e) => e.id).sort());
+      expectNoExtraction();
     });
   });
 

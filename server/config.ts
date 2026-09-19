@@ -92,11 +92,13 @@ export const envSchema = z
     // Tuning knob:
     //   - LLM_V3_CONCURRENCY=1 reverts to fully sequential (rollback path)
     //   - LLM_V3_CONCURRENCY=20 saturates NIM but risks 429s mid-run
-    //   - default=12 balances throughput against rate-limit safety
+    //   - default=8: gemma-4-31b-it answers a 2-group batch in ~15 s, so 8 in
+    //     flight is ~32 requests/min — just under NIM's 40/min free-tier cap.
+    //     (12 was sized for the retired qwen model at ~27 s per batch.)
     //
     // The setting only affects the per-batch fan-out; resolver geocoding is
     // still serialized at 1 req/s for Nominatim regardless of this value.
-    LLM_V3_CONCURRENCY: z.coerce.number().int().positive().default(12),
+    LLM_V3_CONCURRENCY: z.coerce.number().int().positive().default(8),
 
     // Phase 30 D-07 (LLM-RELI-03) — promoted from the hard-coded
     // `const BATCH_SIZE = 2` at server/lib/llmEventExtractor.v3.ts (D-10

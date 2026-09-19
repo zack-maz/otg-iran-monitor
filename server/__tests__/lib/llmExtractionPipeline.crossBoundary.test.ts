@@ -1,32 +1,14 @@
 // @vitest-environment node
 /**
- * Phase 30 Plan 03 Task 3 — D-04 / SIMPLIFY-01 no-mid-run-write invariant.
+ * A run that is cut short keeps its finished waves, and the next run resumes.
  *
- * Pre-Phase-30 this file (Phase 28.2.6 Plan 01 Task 2 — D-07) asserted that
- * two consecutive partial runs (5 batches → simulated Vercel function-kill,
- * then 5 batches in a follow-up tick) produced the SAME final cache state
- * as one continuous 10-batch run. The mid-run durability guarantee was
- * provided by the periodic-flush mechanism (every-N-batches
- * `mergeAndPersistLlmEntities` call from `onBatchComplete`).
+ * Vercel kills the function at 800 s and a cold corpus needs more than that.
+ * Every wave is persisted to `events:llm:v3` as it finishes, and a run only
+ * sends the extractor the groups whose `llm-v3-<group key>` id is not in the
+ * cache yet — so the corpus fills over consecutive runs instead of starting
+ * cold every night.
  *
- * Phase 30 D-04 retires that mechanism on the Pro 800s ceiling (CONTEXT
- * D-04 / threat model T-30-03: mid-run-crash now loses all progress is
- * `accept`'d — Plan 06 Run 2 validated 0 watchdog hard-kills inside budget,
- * so the crash window is negligible).
- *
- * Post-Phase-30 invariants validated here:
- *   - A mid-run abort (simulated function-kill before the terminal write
- *     completes) leaves the `events:llm:v3` key EMPTY. No partial state is
- *     persisted to the terminal key from within the batch loop.
- *   - The terminal write fires exactly once at the end of a complete
- *     happy-path run (mirrors the same invariant tested by
- *     llmExtractionPipeline.terminalShape.test.ts; kept here for the
- *     mid-run-abort negative-shape coverage that lives in this file).
- *
- * The Pitfall 1 cache bridge in `server/routes/events.ts` is the runtime
- * fallback that preserves the "map never goes blank" contract under
- * mid-run-crash (`events:gdelt` raw bridge); that contract is verified by
- * the route's own test, not here.
+ * LLM_V3_CONCURRENCY is pinned to 1 (wave = 4 groups).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -35,21 +17,25 @@ const { mockEnv } = vi.hoisted(() => ({
   mockEnv: {
     NVIDIA_NIM_API_KEY: 'fake',
     OPENROUTER_API_KEY: '',
-    LLM_BATCH_TIMEOUT_MS: 120_000, // Phase 30 D-02 retune (was 90_000)
+    LLM_BATCH_TIMEOUT_MS: 120_000,
     LLM_V3_CONCURRENCY: 1,
     V3_ADAPTIVE_BATCH: false,
     V3_LINEAGE_PREFILTER: false,
     V3_WATCHDOG_ROLLBACK_THRESHOLD: 2,
-    // Phase 30 D-04 (SIMPLIFY-01): legacy flush-cadence env var stripped
-    // from mockEnv when the Zod schema entry was deleted in Plan 03 Task 2.
-    LLM_BATCH_SIZE: 2, // Phase 30 D-07 — env-tunable (was hard-coded const)
+    LLM_BATCH_SIZE: 2,
     CRON_SECRET: '',
   },
 }));
 
+const LLM_KEY = 'events:llm:v3';
+
 const cacheStore = new Map<string, unknown>();
-const cacheSetSpy = vi.fn(async (key: string, data: unknown, _ttl: number) => {
+const cacheSetSafeSpy = vi.fn(async (key: string, data: unknown, _ttl: number) => {
   cacheStore.set(key, data);
+});
+const cacheSetReportedSpy = vi.fn(async (key: string, data: unknown, _ttl: number) => {
+  cacheStore.set(key, data);
+  return { ok: true } as const;
 });
 const cacheGetSpy = vi.fn(async (key: string, _maxAgeMs: number) =>
   cacheStore.has(key) ? { data: cacheStore.get(key), fetchedAt: Date.now() } : null,
@@ -57,45 +43,28 @@ const cacheGetSpy = vi.fn(async (key: string, _maxAgeMs: number) =>
 
 vi.mock('../../cache/redis.js', () => ({
   cacheGetSafe: cacheGetSpy,
-  cacheSetSafe: cacheSetSpy,
+  cacheSetSafe: cacheSetSafeSpy,
+  cacheSetReported: cacheSetReportedSpy,
   redis: {
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
-vi.mock('../../config.js', () => ({
-  env: mockEnv,
-}));
+vi.mock('../../config.js', () => ({ env: mockEnv }));
 
-vi.mock('@vercel/functions', () => ({
-  waitUntil: (p: Promise<unknown>) => {
-    void p.catch(() => {});
-  },
-}));
-
-// Phase 28.2.6 Plan 02 cross-plan defense — Task 3 swapped the IIFE wrapper
-// from `void (async () => {...})()` to `safeWaitUntil((async () => {...})())`.
-// The local-dev fallback in safeWaitUntil runs `promise.catch(...)` so the IIFE
-// still executes under test, but we mock the shim itself for clarity + so a
-// future regression that changes safeWaitUntil's local-dev path can't silently
-// break these tests. The pre-existing `vi.mock('@vercel/functions', ...)` is
-// retained as defense-in-depth — if anyone later removes the safeWaitUntil
-// mock, the @vercel/functions mock still keeps the IIFE running under test.
+// The run body is handed to safeWaitUntil and never awaited by the caller;
+// keeping the promise lets a test wait for the run to finish.
+let runPromise: Promise<unknown> = Promise.resolve();
 vi.mock('../../lib/safeWaitUntil.js', () => ({
   safeWaitUntil: (p: Promise<unknown>) => {
-    void p.catch(() => {});
+    runPromise = p.catch(() => {});
   },
 }));
 
 vi.mock('../../lib/logger.js', () => ({
   logger: {
-    child: () => ({
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    }),
+    child: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
   },
 }));
 
@@ -118,23 +87,31 @@ vi.mock('../../lib/sourceTiers.js', () => ({
   getHighestTier: vi.fn().mockReturnValue(2),
 }));
 
-const runEvalSpy = vi.fn().mockResolvedValue({
-  score: 0.85,
-  withinKm5: 30,
-  withinKm20: 35,
-  withinKm100: 40,
-  total: 50,
-});
 vi.mock('../../lib/llmEvalHarness.js', () => ({
-  runEval: runEvalSpy,
+  runEval: vi.fn().mockResolvedValue({ within5km: 1, within20km: 1, within100km: 1, total: 1 }),
 }));
 
 const groupGdeltRowsMock = vi.fn();
 vi.mock('../../lib/eventGrouping.js', () => ({
   groupGdeltRows: groupGdeltRowsMock,
-  // GDELT-MATCH-02 — pipeline runs dedup pre-pass before grouping; identity
-  // mock keeps these assertions driving group keys through groupGdeltRowsMock.
   dedupHighConfidence: vi.fn((entities: unknown[]) => entities),
+  enrichedIdForGroup: (key: string) => `llm-v3-${key}`,
+}));
+
+vi.mock('../../lib/llmDLQ.js', () => ({ countDLQ: vi.fn(async () => 0) }));
+
+vi.mock('../../lib/llmRunHistory.js', () => ({
+  openRunRecord: vi.fn(async () => {}),
+  closeRunRecord: vi.fn(async () => {}),
+}));
+
+// The URL-liveness post-step runs after every extraction; stubbed so these
+// tests touch neither Redis nor the network.
+vi.mock('../../lib/urlLiveness.js', () => ({
+  buildProbeCandidates: vi.fn(async () => ({ candidates: [], classifiedNoUrl: 0 })),
+  pruneDeadUrlEvents: vi.fn(async () => ({ prunedCount: 0, prunedIds: [] })),
+  runProbeSweep: vi.fn(async () => ({ probed: 0, skippedBudget: 0 })),
+  SWEEP_SAFETY_MARGIN_MS: 60_000,
 }));
 
 const { llmProgressSingleton } = vi.hoisted(() => ({
@@ -145,137 +122,13 @@ vi.mock('../../lib/llmProgress.js', () => ({
     Object.assign(llmProgressSingleton, patch);
   }),
   resetProgress: vi.fn(() => {
-    for (const k of Object.keys(llmProgressSingleton)) {
-      delete llmProgressSingleton[k];
-    }
+    for (const k of Object.keys(llmProgressSingleton)) delete llmProgressSingleton[k];
     llmProgressSingleton.stage = 'grouping';
     llmProgressSingleton.startedAt = Date.now();
   }),
   llmProgress: llmProgressSingleton,
   buildSummary: vi.fn().mockReturnValue({}),
 }));
-
-let totalBatchesForRun = 0;
-let abortAtBatch: number | null = null;
-const enrichedEventsByBatch: Record<number, unknown[]> = {};
-
-const processEventGroupsMock = vi.fn(
-  async (
-    _groups: unknown[],
-    onBatchComplete?:
-      | ((completed: number, total: number) => void)
-      | ((completed: number, total: number) => Promise<void>),
-  ) => {
-    const total = totalBatchesForRun;
-    const allEvents: unknown[] = [];
-    for (let c = 1; c <= total; c++) {
-      if (abortAtBatch !== null && c > abortAtBatch) {
-        // Simulate Vercel function kill — batches beyond abortAtBatch never
-        // produce events and never invoke the callback.
-        break;
-      }
-      const batchEvents = enrichedEventsByBatch[c] ?? [];
-      allEvents.push(...batchEvents);
-      // Phase 35 D-12 (SIMPLIFY-02): writePartialCache writer retired, so this
-      // mock no longer simulates the partial-key write. onBatchComplete drives
-      // terminal-key writes directly via the pipeline.
-      const ret = onBatchComplete?.(c, total);
-      if (ret && typeof (ret as Promise<void>).then === 'function') {
-        await ret;
-      }
-    }
-    if (abortAtBatch !== null) {
-      // Throw to short-circuit the rest of the IIFE — final geocode + cache
-      // write never run. The pipeline's outer try/catch catches the error,
-      // logs it, and the IIFE exits — same surface as a Vercel kill.
-      throw new Error('SIMULATED_VERCEL_KILL');
-    }
-    return {
-      schemaVersion: 'v3' as const,
-      events: allEvents,
-      matchedNewsByGroup: new Map(),
-      bellingcatByGroup: new Map(),
-    };
-  },
-);
-
-// Phase 38 LLM-PURGE-01 — pipeline now imports the v3 extractor directly
-// (the `llmEventExtractor.js` stub barrel was deleted). geocodeEnrichedEventsV3
-// takes the v3-native signature `(events, groupsByKey, matchedNewsByGroup,
-// bellingcatByGroup, onComplete)` and returns a flat array (no tagged shape).
-const geocodeEnrichedEventsMock = vi.fn(
-  async (
-    events: Array<Record<string, unknown>>,
-    _groupsByKey: any,
-    _matchedNews: any,
-    _bellingcat: any,
-    onProgress?: any,
-  ) => {
-    const out = events.map((e) => {
-      const groupKey = (e as { groupKey: string }).groupKey;
-      return {
-        ...e,
-        resolvedLat: 35.0 + groupKey.length * 0.001,
-        resolvedLng: 50.0 + groupKey.length * 0.001,
-        displayName: `Test Site ${groupKey}`,
-        geocodeProvenance: 'nominatim-direct' as const,
-        precision: 'city' as const,
-        suspect: false,
-        actionGeoDistanceKm: 0,
-      };
-    });
-    if (typeof onProgress === 'function') {
-      onProgress(out.length, out.length);
-    }
-    return out;
-  },
-);
-
-vi.mock('../../lib/llmEventExtractor.v3.js', () => ({
-  processEventGroupsV3: processEventGroupsMock,
-  geocodeEnrichedEventsV3: geocodeEnrichedEventsMock,
-}));
-
-interface MinimalEntity {
-  id: string;
-  type: string;
-  lat: number;
-  lng: number;
-  timestamp: number;
-  label: string;
-  data: Record<string, unknown>;
-}
-
-function makeRawEntity(id: string): MinimalEntity {
-  return {
-    id,
-    type: 'airstrike',
-    lat: 35,
-    lng: 50,
-    timestamp: Date.UTC(2026, 3, 15),
-    label: 't',
-    data: {
-      eventType: 'Aerial weapons',
-      cameoCode: '195',
-      numMentions: 5,
-      numSources: 2,
-    },
-  };
-}
-
-function makeGroup(key: string) {
-  return {
-    key,
-    entities: [makeRawEntity(`raw-${key}`)],
-    centroidLat: 35,
-    centroidLng: 50,
-    primaryCameo: '195',
-    timestamp: Date.UTC(2026, 3, 15),
-    totalMentions: 5,
-    totalSources: 2,
-    sourceUrls: ['https://example.com'],
-  };
-}
 
 function makeEnrichedV3Event(groupKey: string): Record<string, unknown> {
   return {
@@ -304,78 +157,159 @@ function makeEnrichedV3Event(groupKey: string): Record<string, unknown> {
   };
 }
 
-async function driveRun(numBatches: number, opts?: { abortAt?: number }) {
-  totalBatchesForRun = numBatches;
-  abortAtBatch = opts?.abortAt ?? null;
-  for (let c = 1; c <= numBatches; c++) {
-    enrichedEventsByBatch[c] = [makeEnrichedV3Event(`g${c}`)];
-  }
-  const rawEvents = Array.from({ length: numBatches }, (_, i) => makeRawEntity(`raw-${i + 1}`));
-  cacheStore.set('events:gdelt', rawEvents);
-  groupGdeltRowsMock.mockReturnValue(
-    Array.from({ length: numBatches }, (_, i) => makeGroup(`g${i + 1}`)),
+// The extractor is called once per wave. `killAtWave` makes that wave throw,
+// which ends the run body the way a function kill would: nothing after the
+// throw runs, earlier waves have already been handed to geocode + persist.
+let killAtWave: number | null = null;
+let waveCalls = 0;
+const processEventGroupsMock = vi.fn(
+  async (groups: Array<{ key: string }>, onBatchComplete?: (c: number, t: number) => void) => {
+    waveCalls++;
+    if (killAtWave !== null && waveCalls >= killAtWave) throw new Error('SIMULATED_FUNCTION_KILL');
+    const total = Math.ceil(groups.length / 2);
+    for (let c = 1; c <= total; c++) onBatchComplete?.(c, total);
+    return {
+      schemaVersion: 'v3' as const,
+      events: groups.map((g) => makeEnrichedV3Event(g.key)),
+      matchedNewsByGroup: new Map(),
+      bellingcatByGroup: new Map(),
+    };
+  },
+);
+
+const geocodeEnrichedEventsMock = vi.fn(
+  async (
+    events: Array<Record<string, unknown>>,
+    _groupsByKey: unknown,
+    _matchedNews: unknown,
+    _bellingcat: unknown,
+    onProgress?: (completed: number, total: number) => void,
+  ) => {
+    const out = events.map((e) => ({
+      ...e,
+      resolvedLat: 35,
+      resolvedLng: 50,
+      displayName: `Test Site ${String(e.groupKey)}`,
+      geocodeProvenance: 'nominatim-direct' as const,
+      precision: 'city' as const,
+      suspect: false,
+      actionGeoDistanceKm: 0,
+    }));
+    onProgress?.(out.length, out.length);
+    return out;
+  },
+);
+
+vi.mock('../../lib/llmEventExtractor.v3.js', () => ({
+  processEventGroupsV3: processEventGroupsMock,
+  geocodeEnrichedEventsV3: geocodeEnrichedEventsMock,
+}));
+
+function makeRawEntity(id: string) {
+  return {
+    id,
+    type: 'airstrike',
+    lat: 35,
+    lng: 50,
+    timestamp: Date.UTC(2026, 3, 15),
+    label: 't',
+    data: { eventType: 'Aerial weapons', cameoCode: '195', numMentions: 5, numSources: 2 },
+  };
+}
+
+function makeGroup(key: string) {
+  return {
+    key,
+    entities: [makeRawEntity(`raw-${key}`)],
+    centroidLat: 35,
+    centroidLng: 50,
+    primaryCameo: '195',
+    timestamp: Date.UTC(2026, 3, 15),
+    totalMentions: 5,
+    totalSources: 2,
+    sourceUrls: ['https://example.com'],
+  };
+}
+
+async function driveRun(numGroups: number, opts: { killAtWave?: number } = {}) {
+  killAtWave = opts.killAtWave ?? null;
+  waveCalls = 0;
+  const keys = Array.from({ length: numGroups }, (_, i) => `g${i + 1}`);
+  cacheStore.set(
+    'events:gdelt',
+    keys.map((k) => makeRawEntity(`raw-${k}`)),
   );
+  groupGdeltRowsMock.mockReturnValue(keys.map(makeGroup));
 
   const { runRefreshExtraction } = await import('../../lib/llmExtractionPipeline.js');
   await runRefreshExtraction({ triggeredBy: 'cron', forceCooldown: true });
-  for (let i = 0; i < 50; i++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await runPromise;
+  // When a wave throws, the previous wave's geocode + persist is still in
+  // flight and nothing in the run body awaits it; give it a turn to land.
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
-const sortById = <T extends { id?: string }>(arr: T[]): T[] =>
-  [...arr].sort((a, b) => (a.id ?? '').localeCompare(b.id ?? ''));
+const cachedIds = () =>
+  ((cacheStore.get(LLM_KEY) as Array<{ id: string }> | undefined) ?? []).map((e) => e.id).sort();
+
+const sortById = <T extends { id: string }>(arr: T[]): T[] =>
+  [...arr].sort((a, b) => a.id.localeCompare(b.id));
 
 beforeEach(() => {
   cacheStore.clear();
-  cacheSetSpy.mockClear();
+  cacheSetSafeSpy.mockClear();
+  cacheSetReportedSpy.mockClear();
   cacheGetSpy.mockClear();
   processEventGroupsMock.mockClear();
   geocodeEnrichedEventsMock.mockClear();
   groupGdeltRowsMock.mockClear();
-  runEvalSpy.mockClear();
-  for (const k of Object.keys(llmProgressSingleton)) {
-    delete llmProgressSingleton[k];
-  }
+  for (const k of Object.keys(llmProgressSingleton)) delete llmProgressSingleton[k];
   llmProgressSingleton.stage = 'idle';
-  abortAtBatch = null;
+  runPromise = Promise.resolve();
 });
 
-describe('runRefreshExtraction — no mid-run terminal write (D-04 / SIMPLIFY-01)', () => {
-  it('mid-run abort (function-kill before terminal write): events:llm:v3 stays empty', async () => {
-    // Drive 10 groups but abort the IIFE after batch 5 (simulated Vercel
-    // function-kill). Pre-Phase-30 the periodic-flush at batch 5 would have
-    // persisted 5 events to the terminal key; post-D-04 there is no mid-run
-    // write site, so the terminal key remains absent (CONTEXT D-04 / threat
-    // model T-30-03 accepted disposition: mid-run-crash loses all progress).
-    await driveRun(10, { abortAt: 5 });
-    const partialAfterAbort = cacheStore.get('events:llm:v3') as Array<{ id: string }> | undefined;
-    expect(partialAfterAbort).toBeUndefined();
+describe('runRefreshExtraction — a run cut short keeps its finished waves and the next run resumes', () => {
+  it('a run killed in its second wave leaves the first wave in events:llm:v3', async () => {
+    await driveRun(10, { killAtWave: 2 });
 
-    // The cacheSetSpy should also reflect zero terminal writes during the
-    // aborted run — negative-shape coverage for the periodic-flush deletion.
-    const terminalCalls = cacheSetSpy.mock.calls.filter(([k]) => k === 'events:llm:v3');
-    expect(terminalCalls.length).toBe(0);
+    expect(cachedIds()).toEqual(['llm-v3-g1', 'llm-v3-g2', 'llm-v3-g3', 'llm-v3-g4']);
   });
 
-  it('happy-path 10-batch run: events:llm:v3 receives exactly ONE terminal write', async () => {
+  it('the next run sends the extractor only the groups missing from the cache', async () => {
+    await driveRun(10, { killAtWave: 2 });
+    processEventGroupsMock.mockClear();
+
     await driveRun(10);
 
-    const terminalCalls = cacheSetSpy.mock.calls.filter(([k]) => k === 'events:llm:v3');
-    // Phase 30 D-04 (SIMPLIFY-01): periodic-flush retired; the single
-    // end-of-pipeline mergeAndPersistLlmEntities call is now the sole
-    // writer of the terminal cache key. Mirrors the exactly-once invariant
-    // asserted in llmExtractionPipeline.terminalShape.test.ts; kept here
-    // for the cross-file durability-and-shape regression surface.
-    expect(terminalCalls.length).toBe(1);
+    const extracted = processEventGroupsMock.mock.calls.map(([groups]) => groups.map((g) => g.key));
+    expect(extracted).toEqual([
+      ['g5', 'g6', 'g7', 'g8'],
+      ['g9', 'g10'],
+    ]);
+  });
 
-    const finalEntities = terminalCalls[0]![1] as Array<{ id: string }>;
-    expect(Array.isArray(finalEntities)).toBe(true);
-    // All 10 batches each emitted 1 enriched event in the harness; the
-    // terminal write should carry all 10 after the post-loop geocode.
-    expect(finalEntities.length).toBe(10);
-    // Stable ordering for diff-friendliness on regression.
-    const sorted = sortById(finalEntities);
-    expect(sorted[0]!.id).toBeDefined();
+  it('a killed run plus its follow-up end with the same cache as one uninterrupted run', async () => {
+    await driveRun(10, { killAtWave: 2 });
+    await driveRun(10);
+    const resumed = sortById(cacheStore.get(LLM_KEY) as Array<{ id: string }>);
+
+    cacheStore.clear();
+    await driveRun(10);
+    const uninterrupted = sortById(cacheStore.get(LLM_KEY) as Array<{ id: string }>);
+
+    expect(resumed).toHaveLength(10);
+    expect(resumed).toEqual(uninterrupted);
+  });
+
+  it('a run with nothing left to enrich calls neither the extractor nor the cache write', async () => {
+    await driveRun(6);
+    processEventGroupsMock.mockClear();
+    cacheSetReportedSpy.mockClear();
+
+    await driveRun(6);
+
+    expect(processEventGroupsMock).not.toHaveBeenCalled();
+    expect(cacheSetReportedSpy).not.toHaveBeenCalled();
+    expect(llmProgressSingleton.stage).toBe('done');
   });
 });

@@ -215,7 +215,7 @@ export function groupGdeltRows(entities: ConflictEventEntity[]): EventGroup[] {
     if (!matched) {
       // Create new group
       groups.push({
-        key: `grp-${entityDay}-${entityRoot}-${groups.length}`,
+        key: '', // assigned below, once membership is final
         entities: [entity],
         centroidLat: entity.lat,
         centroidLng: entity.lng,
@@ -228,5 +228,66 @@ export function groupGdeltRows(entities: ConflictEventEntity[]): EventGroup[] {
     }
   }
 
+  // The key is derived from content — day, CAMEO root and the lowest GDELT
+  // event id in the group — never from the group's position in this pass. The
+  // corpus is re-sampled between runs, and a positional index shifts every
+  // later key as soon as one earlier row appears: the pipeline's "only new
+  // groups" diff then misses, and merge-by-id writes one event's enrichment
+  // over another's.
+  for (const group of groups) {
+    const day = dayBucket(group.timestamp);
+    const root = cameoRoot(group.primaryCameo);
+    group.key = `grp-${day}-${root}-${lowestEntityId(group.entities)}`;
+  }
+
   return groups;
+}
+
+/** Lowest member id, numeric where the id is `gdelt-<GlobalEventID>`. */
+function lowestEntityId(entities: ConflictEventEntity[]): string {
+  let best = '';
+  let bestNum = Number.POSITIVE_INFINITY;
+  for (const e of entities) {
+    const bare = e.id.replace(/^gdelt-/, '');
+    const num = Number(bare);
+    if (Number.isFinite(num)) {
+      if (num < bestNum) {
+        bestNum = num;
+        best = bare;
+      }
+    } else if (bestNum === Number.POSITIVE_INFINITY && (best === '' || bare < best)) {
+      best = bare;
+    }
+  }
+  return best;
+}
+
+/** Id of the enriched entity the LLM pipeline writes for a group. */
+export function enrichedIdForGroup(groupKey: string): string {
+  return `llm-v3-${groupKey}`;
+}
+
+/**
+ * The events to serve while the enriched cache covers only part of the corpus:
+ * every enriched event, plus the raw rows of each group that has no enriched
+ * event yet.
+ *
+ * The pipeline fills `events:llm:v3` a wave at a time, most severe groups
+ * first, over several runs. Serving the enriched cache alone (the behaviour
+ * when a run wrote the whole corpus at once) would shrink the map to the first
+ * wave — 30 events in place of ~1,000 — until the corpus is covered. Pure:
+ * nothing here calls the LLM or writes a cache, so it is safe on the read path.
+ */
+export function fillWithRawEvents(
+  enriched: ConflictEventEntity[],
+  raw: ConflictEventEntity[],
+): ConflictEventEntity[] {
+  if (raw.length === 0) return enriched;
+  if (enriched.length === 0) return raw;
+  const enrichedIds = new Set(enriched.map((e) => e.id));
+  const uncovered: ConflictEventEntity[] = [];
+  for (const group of groupGdeltRows(dedupHighConfidence(raw))) {
+    if (!enrichedIds.has(enrichedIdForGroup(group.key))) uncovered.push(...group.entities);
+  }
+  return [...enriched, ...uncovered];
 }

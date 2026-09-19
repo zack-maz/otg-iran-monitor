@@ -1,25 +1,17 @@
 // @vitest-environment node
 /**
- * Phase 39 SC39-3 gap closure — honest run-record accounting (WR-01 + WR-04).
+ * The closed run record tells the truth about a run.
  *
- * These tests would have CAUGHT the two server-side flight-recorder defects:
+ *  - A run whose batches fail reports `batchesFailed > 0` and a non-green
+ *    outcome. The extractor ticks its completed-batch counter on every
+ *    terminal branch (success and failure), so `total - completed` is always
+ *    ~0; the record must use the extractor's own failure tally
+ *    (`llmProgress.failedBatches`) and the DLQ growth across the run.
+ *  - `runEval()`'s result reaches the record's `evalScore` in the harness
+ *    shape (`{ within5km, within20km, within100km, total }`).
  *
- *   WR-01 — a run where batches FAIL must report `batchesFailed > 0` and a
- *           non-green outcome. Before the fix, `finishBatch()` ticked the
- *           completed-batch counter on every terminal branch, so the run record
- *           derived `batchesFailed = totalBatches - completedBatches ≈ 0` and a
- *           fully-failed run painted SUCCESS/green. We drive the extractor mock
- *           so it stamps `llmProgress.failedBatches` (the new honest tally) and
- *           assert the CLOSED run record carries it through, with `dlqDelta`
- *           computed from the SCARD open/close snapshot.
- *
- *   WR-04 — `runEval()`'s result must reach the closed run record's `evalScore`.
- *           We assert the snapshot carries the real harness shape
- *           (`{ within5km, within20km, within100km, total }`).
- *
- * The run record is captured by spying on `closeRunRecord` (the terminal
- * re-LPUSH). We assert on its argument rather than on Redis internals so the
- * test pins the public RunHistoryEntry contract the FlightRecorder reads.
+ * The record is captured from `closeRunRecord`'s argument — the public
+ * RunHistoryEntry contract the FlightRecorder reads — not from Redis.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -46,13 +38,17 @@ const cacheGetSpy = vi.fn(async (key: string, _maxAgeMs: number) =>
   cacheStore.has(key) ? { data: cacheStore.get(key), fetchedAt: Date.now() } : null,
 );
 
-// SCARD-backed DLQ size — drives the dlqDelta open/close snapshot (WR-01).
+// SCARD-backed DLQ size — drives the dlqDelta open/close snapshot.
 let dlqSize = 0;
 const scardMock = vi.fn(async () => dlqSize);
 
 vi.mock('../../cache/redis.js', () => ({
   cacheGetSafe: cacheGetSpy,
   cacheSetSafe: cacheSetSpy,
+  cacheSetReported: vi.fn(async (key: string, data: unknown, ttl: number) => {
+    await cacheSetSpy(key, data, ttl);
+    return { ok: true } as const;
+  }),
   redis: {
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue(undefined),
@@ -108,6 +104,7 @@ const groupGdeltRowsMock = vi.fn();
 vi.mock('../../lib/eventGrouping.js', () => ({
   groupGdeltRows: groupGdeltRowsMock,
   dedupHighConfidence: vi.fn((entities: unknown[]) => entities),
+  enrichedIdForGroup: (key: string) => `llm-v3-${key}`,
 }));
 
 // DLQ — countDLQ() is the open/close snapshot source for dlqDelta. Route it
@@ -135,7 +132,7 @@ vi.mock('../../lib/llmProgress.js', () => ({
 }));
 
 // Capture run-record lifecycle. closeRunRecord's argument IS the terminal
-// RunHistoryEntry the FlightRecorder reads (WR-01 + WR-04 assertions).
+// RunHistoryEntry the FlightRecorder reads.
 const openRunRecordMock = vi.fn(async () => {});
 const closeRunRecordMock = vi.fn(async () => {});
 vi.mock('../../lib/llmRunHistory.js', () => ({
@@ -146,17 +143,17 @@ vi.mock('../../lib/llmRunHistory.js', () => ({
 // URL-liveness post-step — stub to no-ops so the finally block doesn't touch
 // real Redis / Nominatim in this accounting test.
 vi.mock('../../lib/urlLiveness.js', () => ({
-  buildProbeCandidates: vi.fn(async () => []),
+  buildProbeCandidates: vi.fn(async () => ({ candidates: [], classifiedNoUrl: 0 })),
   pruneDeadUrlEvents: vi.fn(async () => ({ prunedCount: 0, prunedIds: [] })),
   runProbeSweep: vi.fn(async () => ({ probed: 0, skippedBudget: 0 })),
   SWEEP_SAFETY_MARGIN_MS: 60_000,
 }));
 
 /**
- * Extractor mock. `failedBatches` controls how many batches stamp the new
- * honest failure tally onto the progress singleton (WR-01). `produceEvents`
- * controls whether the run yields enriched events (so we can model a fully
- * failed run vs. a partial run).
+ * Extractor mock. `mockFailedBatches` is the failure tally the extractor
+ * stamps onto the progress singleton; `mockProduceEvents` decides whether the
+ * run yields enriched events (a fully failed run vs. a partial one). The
+ * pipeline owns `totalBatches` (2 groups per batch), so the mock leaves it alone.
  */
 let mockFailedBatches = 0;
 let mockProduceEvents = true;
@@ -165,9 +162,7 @@ const processEventGroupsMock = vi.fn(
     groups: unknown[],
     onBatchComplete?: (completed: number, total: number) => void | Promise<void>,
   ) => {
-    const total = groups.length;
-    // Stamp totalBatches like the real pipeline does (one batch per group here).
-    llmProgressSingleton.totalBatches = total;
+    const total = Math.ceil(groups.length / 2);
     // Emulate the v3 extractor's per-failure tally.
     if (mockFailedBatches > 0) {
       llmProgressSingleton.failedBatches = mockFailedBatches;
@@ -313,7 +308,7 @@ beforeEach(() => {
   llmProgressSingleton.stage = 'idle';
 });
 
-describe('Phase 39 SC39-3 WR-01 — honest batchesFailed + dlqDelta', () => {
+describe('run record — batchesFailed and dlqDelta come from real failures, not from total - completed', () => {
   it('a fully-failed run reports batchesFailed > 0 and an honest (non-success) outcome', async () => {
     // Every batch fails: extractor stamps failedBatches and returns null events.
     mockFailedBatches = 2;
@@ -322,27 +317,27 @@ describe('Phase 39 SC39-3 WR-01 — honest batchesFailed + dlqDelta', () => {
     scardMock.mockImplementationOnce(async () => 0); // open snapshot
     scardMock.mockImplementation(async () => 2); // close snapshot + thereafter
 
-    await driveRunWithGroups(['a-1', 'b-1']);
+    await driveRunWithGroups(['a-1', 'b-1', 'c-1', 'd-1']);
 
     const rec = lastClosedRecord();
-    // Honest failure tally — the OLD derivation (total - completedBatches) was 0.
+    // 4 groups = 2 batches, both failed; `total - completedBatches` would say 0.
     expect(rec.batchCount).toBe(2);
     expect(rec.batchesFailed).toBe(2);
     expect(rec.batchesCompleted).toBe(0); // zero genuine successes
     // Null extraction → 'error' outcome (a non-green band), never 'completed'.
     expect(rec.outcome).toBe('error');
-    // Real DLQ growth surfaced (was hardcoded 0 before WR-01).
+    // DLQ growth across the run (close snapshot - open snapshot).
     expect(rec.dlqDelta).toBe(2);
   });
 
   it('a partial run (some batches failed, some succeeded) reports a non-zero batchesFailed', async () => {
-    // 2 groups; 1 batch fails but the run still produces events.
+    // 2 batches; 1 fails but the run still produces events.
     mockFailedBatches = 1;
     mockProduceEvents = true;
     scardMock.mockImplementationOnce(async () => 5); // open
     scardMock.mockImplementation(async () => 6); // close (one new DLQ entry)
 
-    await driveRunWithGroups(['a-1', 'b-1']);
+    await driveRunWithGroups(['a-1', 'b-1', 'c-1', 'd-1']);
 
     const rec = lastClosedRecord();
     expect(rec.batchCount).toBe(2);
@@ -359,7 +354,7 @@ describe('Phase 39 SC39-3 WR-01 — honest batchesFailed + dlqDelta', () => {
     mockProduceEvents = true;
     scardMock.mockImplementation(async () => 3); // unchanged across run
 
-    await driveRunWithGroups(['a-1', 'b-1']);
+    await driveRunWithGroups(['a-1', 'b-1', 'c-1', 'd-1']);
 
     const rec = lastClosedRecord();
     expect(rec.batchesFailed).toBe(0);
@@ -369,15 +364,15 @@ describe('Phase 39 SC39-3 WR-01 — honest batchesFailed + dlqDelta', () => {
   });
 });
 
-describe('Phase 39 SC39-3 WR-04 — eval score written into the run record', () => {
+describe('run record — the eval score is written into the closed record', () => {
   it('closed run record carries the real harness eval shape (within20km/total)', async () => {
-    await driveRunWithGroups(['a-1', 'b-1']);
+    await driveRunWithGroups(['a-1', 'b-1', 'c-1', 'd-1']);
 
     expect(runEvalSpy).toHaveBeenCalled();
     const rec = lastClosedRecord();
     expect(rec.evalScore).toEqual(evalShape);
-    // The eval shape has NO `.score` key — it carries the bucket+total contract
-    // the client normalizeEvalScore (WR-05) now reads.
+    // The eval shape has no `.score` key — it carries the bucket + total
+    // contract the client's normalizeEvalScore reads.
     expect((rec.evalScore as Record<string, unknown>).within20km).toBe(42);
     expect((rec.evalScore as Record<string, unknown>).total).toBe(50);
   });

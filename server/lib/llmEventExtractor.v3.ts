@@ -96,6 +96,9 @@ const log = logger.child({ module: 'llm-extractor-v3' });
  *  wider group context for qwen-235b. */
 const BATCH_SIZE = env.LLM_BATCH_SIZE;
 
+/** Events geocoded in parallel. Nominatim itself stays at 1 req/s (llmResolver throttle). */
+const GEOCODE_CONCURRENCY = 4;
+
 /** Phase 27.4.3 D-08 bake-off — empty/undefined uses freeClaudeRouter's
  *  NVIDIA_NIM_DEFAULT_MODEL. Set V3_BAKEOFF_MODEL=<id> in env to swap the
  *  primary model for a single extractor run during multi-model evaluation. */
@@ -250,6 +253,12 @@ export interface V3ExtractionRun {
   events: EnrichedEventV3[] | null;
   matchedNewsByGroup: Map<string, NewsArticleForPrompt[]>;
   bellingcatByGroup: Map<string, { lat: number; lng: number }>;
+  /**
+   * HTTP status of a provider answer no retry can fix (401/403 key rejected,
+   * 404 model not served, 410 model retired). Once seen, the remaining batches
+   * are skipped; the caller should end the run and report it.
+   */
+  fatalStatus?: number;
 }
 
 /** EnrichedEventV3 after geocodeEnrichedEventsV3 — adds resolved coord + provenance + precision + display fields. */
@@ -475,6 +484,7 @@ export async function processEventGroupsV3(
 
   const results: EnrichedEventV3[] = [];
   let allFailed = true;
+  let fatalStatus: number | undefined;
 
   // Phase 27.4.4 D-18 — group-level lineage pre-filter. When enabled, every
   // group gets a stable hash (key + sorted(sourceUrls) + totalMentions) and
@@ -597,6 +607,14 @@ export async function processEventGroupsV3(
 
     tasks.push(
       limit(async () => {
+        // A retired model or a rejected key fails every call the same way;
+        // stop spending the run on it.
+        if (fatalStatus !== undefined) {
+          recordFailedBatch();
+          await finishBatch();
+          return;
+        }
+
         // Parallel Redis reads per group in the batch (BATCH_SIZE * 2 keys each).
         const contexts = await Promise.all(batch.map(buildPromptContext));
 
@@ -649,6 +667,13 @@ export async function processEventGroupsV3(
               },
             );
             routing = result.routing;
+            if (result.fatalStatus !== undefined && fatalStatus === undefined) {
+              fatalStatus = result.fatalStatus;
+              log.error(
+                { status: fatalStatus, batchIndex },
+                'v3 provider rejected the call permanently — skipping the remaining batches',
+              );
+            }
             // Phase 27.4.4 Plan 02 dev-pass: thread finish_reason so the JSON.parse
             // catch block can tag truncations distinctly from generic malformed JSON.
             finishReason = result.finishReason ?? null;
@@ -904,6 +929,7 @@ export async function processEventGroupsV3(
     events: allFailed ? null : results,
     matchedNewsByGroup,
     bellingcatByGroup,
+    fatalStatus,
   };
 }
 
@@ -1057,11 +1083,19 @@ export async function geocodeEnrichedEventsV3(
   matchedNewsByGroup: Map<string, NewsArticleForPrompt[]>,
   bellingcatByGroup: Map<string, { lat: number; lng: number }>,
   onComplete?: (completed: number, total: number) => void,
+  // Past `deadlineMs` no further event is started and what is done is
+  // returned; the rest are picked up by the next run because their groups are
+  // still absent from the cache.
+  opts: { deadlineMs?: number } = {},
 ): Promise<GeocodedEnrichedEventV3[]> {
-  const out: GeocodedEnrichedEventV3[] = [];
-  for (let i = 0; i < events.length; i++) {
-    const ev = events[i];
-    if (!ev) continue; // noUncheckedIndexedAccess guard — unreachable in practice
+  // A few events at a time: Nominatim stays at one request per second (the
+  // resolver's throttle hands out slots), but an event that needs the LLM
+  // reranker no longer holds up the ones behind it.
+  const limit = createLimit(GEOCODE_CONCURRENCY);
+  const slots: Array<GeocodedEnrichedEventV3 | undefined> = new Array(events.length);
+  let completed = 0;
+  const geocodeOne = async (ev: EnrichedEventV3, i: number): Promise<void> => {
+    if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return;
     const group = groupsByKey.get(ev.groupKey);
     const matchedNews = matchedNewsByGroup.get(ev.groupKey) ?? [];
     const ctx: ResolveContext = {
@@ -1119,7 +1153,7 @@ export async function geocodeEnrichedEventsV3(
       tiers,
     });
 
-    out.push({
+    slots[i] = {
       ...ev,
       resolvedLat: resolved.lat,
       resolvedLng: resolved.lng,
@@ -1128,8 +1162,9 @@ export async function geocodeEnrichedEventsV3(
       suspect,
       actionGeoDistanceKm: resolved.actionGeoDistanceKm,
       displayName: resolved.displayName,
-    });
-    onComplete?.(i + 1, events.length);
-  }
-  return out;
+    };
+    onComplete?.(++completed, events.length);
+  };
+  await Promise.all(events.map((ev, i) => limit(() => geocodeOne(ev, i))));
+  return slots.filter((e): e is GeocodedEnrichedEventV3 => e !== undefined);
 }

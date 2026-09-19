@@ -1,17 +1,11 @@
 // @vitest-environment node
 /**
- * Phase 31 Plan 01 Task 1 — D-01 prep #2 RED unit test.
+ * The "only new groups" diff in `runRefreshExtraction`.
  *
- * Pins the diff-filter prefix-match invariant at
- * `server/lib/llmExtractionPipeline.ts` L269-277. Pre-fix: bare `g.key`
- * compared against the prefixed cached id `llm-v3-<groupKey>` — never
- * matches, so every cron re-processes the full set and doubles NIM
- * rate-limit pressure. Post-fix: `cachedLlmKeys.has(`llm-v3-${g.key}`)`
- * matches the cached id correctly.
- *
- * Both tests in this file MUST go GREEN after the Task 2 prefix-add
- * commit. The first test currently FAILS (RED) — that is the TDD anchor
- * for the fix.
+ * Enriched entities are cached under `enrichedIdForGroup(group.key)`
+ * (`llm-v3-<group key>`). The diff must compare that id, not the bare group
+ * key: a bare-key compare never matches, so every run would re-send the whole
+ * corpus to the LLM.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -41,6 +35,10 @@ const cacheGetSpy = vi.fn(async (key: string, _maxAgeMs: number) =>
 vi.mock('../../cache/redis.js', () => ({
   cacheGetSafe: cacheGetSpy,
   cacheSetSafe: cacheSetSpy,
+  cacheSetReported: vi.fn(async (key: string, data: unknown, ttl: number) => {
+    await cacheSetSpy(key, data, ttl);
+    return { ok: true } as const;
+  }),
   redis: {
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue(undefined),
@@ -107,11 +105,10 @@ vi.mock('../../lib/llmEvalHarness.js', () => ({
 const groupGdeltRowsMock = vi.fn();
 vi.mock('../../lib/eventGrouping.js', () => ({
   groupGdeltRows: groupGdeltRowsMock,
-  // GDELT-MATCH-02 — the pipeline now runs the high-confidence dedup pre-pass
-  // before grouping. Mock it as an identity pass-through so these diff-filter
-  // assertions still drive group keys through `groupGdeltRowsMock` unchanged
-  // (the dedup pass itself is unit-tested in eventGrouping.dedup.test.ts).
+  // The dedup pre-pass is an identity here so group keys come from
+  // `groupGdeltRowsMock` unchanged (dedup is tested in eventGrouping.dedup.test.ts).
   dedupHighConfidence: vi.fn((entities: unknown[]) => entities),
+  enrichedIdForGroup: (key: string) => `llm-v3-${key}`,
 }));
 
 const { llmProgressSingleton } = vi.hoisted(() => ({
@@ -286,12 +283,9 @@ beforeEach(() => {
   llmProgressSingleton.stage = 'idle';
 });
 
-describe('Phase 31 D-01 prep #2 — diff-filter prefix match', () => {
-  it('diff-filter excludes already-cached groups whose key matches the `llm-v3-` prefixed cached id', async () => {
-    // Seed the terminal LLM cache with one already-enriched entity whose id
-    // carries the canonical `llm-v3-` prefix stamped by llmEventExtractor.v3
-    // (per the JSDoc at server/lib/llmExtractionPipeline.ts L438-441 and
-    // Phase 27.4 D-26/D-40 invariant).
+describe('runRefreshExtraction — only groups without an enriched entity reach the extractor', () => {
+  it('a group whose `llm-v3-<key>` id is already cached is not sent again', async () => {
+    // Seed the enriched cache with one entity under the prefixed id.
     cacheStore.set('events:llm:v3', [{ ...makeRawEntity('llm-v3-20513-19-18') }]);
 
     // Drive two raw groups: one whose key matches the cached id post-prefix,
@@ -299,17 +293,15 @@ describe('Phase 31 D-01 prep #2 — diff-filter prefix match', () => {
     await driveRunWithGroups(['20513-19-18', '99999-19-18']);
 
     // The pipeline must invoke processEventGroups exactly once with ONLY the
-    // fresh `99999-19-18` group. Pre-fix the diff-filter compares bare
-    // `20513-19-18` against cached `llm-v3-20513-19-18` (never matches), so
-    // both groups reach the extractor — this assertion fails RED.
+    // fresh `99999-19-18` group. A bare-key compare (`20513-19-18` against
+    // `llm-v3-20513-19-18`) never matches and would send both.
     expect(processEventGroupsMock).toHaveBeenCalledTimes(1);
     const passedGroups = processEventGroupsMock.mock.calls[0]![0] as Array<{ key: string }>;
     expect(passedGroups).toHaveLength(1);
     expect(passedGroups[0]!.key).toBe('99999-19-18');
   });
 
-  it('passes all groups through when LLM cache is empty', async () => {
-    // No `events:llm:v3` entry — cold-cache path, no diff-filter exclusion.
+  it('an empty enriched cache sends every group', async () => {
     await driveRunWithGroups(['20513-19-18', '99999-19-18']);
 
     expect(processEventGroupsMock).toHaveBeenCalledTimes(1);

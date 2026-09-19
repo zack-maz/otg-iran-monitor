@@ -39,14 +39,17 @@ const GEOCODE_CACHE_PREFIX = 'geocode:fwd:constrained:v2:';
 const GEOCODE_CACHE_LOGICAL_TTL_MS = 30 * 24 * 3600 * 1000;
 const GEOCODE_CACHE_REDIS_TTL_SEC = 30 * 24 * 3600;
 const GEOCODE_DELAY_MS = 1000;
-let lastNominatimCallMs = 0;
+let nextNominatimSlotMs = 0;
 
+// Nominatim's usage policy is one request per second. Each caller reserves the
+// next free slot synchronously, before it waits, so callers running
+// concurrently are spaced a second apart instead of all reading the same
+// timestamp and firing together.
 async function throttleNominatim(): Promise<void> {
-  const elapsed = Date.now() - lastNominatimCallMs;
-  if (elapsed < GEOCODE_DELAY_MS) {
-    await new Promise((resolve) => setTimeout(resolve, GEOCODE_DELAY_MS - elapsed));
-  }
-  lastNominatimCallMs = Date.now();
+  const now = Date.now();
+  const slot = Math.max(now, nextNominatimSlotMs);
+  nextNominatimSlotMs = slot + GEOCODE_DELAY_MS;
+  if (slot > now) await new Promise((resolve) => setTimeout(resolve, slot - now));
 }
 
 /**
@@ -55,7 +58,7 @@ async function throttleNominatim(): Promise<void> {
  * no-op in production.
  */
 export function __resetThrottleForTests(): void {
-  lastNominatimCallMs = 0;
+  nextNominatimSlotMs = 0;
 }
 
 function cacheKey(
