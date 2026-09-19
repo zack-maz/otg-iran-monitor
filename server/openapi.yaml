@@ -1139,6 +1139,88 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/cron/llm-probe:
+    get:
+      summary: Probe candidate NVIDIA NIM models with one production-shaped batch each.
+      description: |
+        Sends one v3 extraction call (the real system prompt, two live GDELT
+        groups from `events:gdelt`, JSON mode) to each model in `models` and
+        reports HTTP status, latency, finish reason and whether the reply
+        parses and passes the v3 schema. Writes nothing and bypasses the
+        router, so a failing candidate cannot affect the breaker or the rate
+        window.
+
+        Exists because NIM retires free-tier models (a retired id answers 410
+        on every call) and Production secrets are write-only in Vercel, so a
+        replacement cannot be tried locally. With no `models` parameter the
+        configured production model is probed.
+      tags: [Cron]
+      security:
+        - cronSecret: []
+      parameters:
+        - in: query
+          name: models
+          required: false
+          description: Comma-separated NIM model ids, at most 8. Repeat an id to measure it under concurrency.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            `{ok: true, groups, results[]}`, or `{ok: false, reason}` where
+            `reason` is `llm_unconfigured` or `no_raw_events`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                  reason:
+                    type: string
+                    enum: [llm_unconfigured, no_raw_events]
+                  groups:
+                    type: integer
+                    description: Number of GDELT groups in the probe prompt.
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [model, ok, latencyMs]
+                      properties:
+                        model:
+                          type: string
+                        ok:
+                          type: boolean
+                          description: True when the reply passed the v3 schema.
+                        status:
+                          type: integer
+                          nullable: true
+                          description: HTTP status from NIM; null on a client-side timeout.
+                        latencyMs:
+                          type: integer
+                        finishReason:
+                          type: string
+                          nullable: true
+                        tokensOut:
+                          type: integer
+                          nullable: true
+                        jsonParsed:
+                          type: boolean
+                        schemaValid:
+                          type: boolean
+                        eventCount:
+                          type: integer
+                        error:
+                          type: string
+                          nullable: true
+        '401':
+          description: Missing or invalid CRON_SECRET Bearer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/cron/refresh-events:
     get:
       summary: Daily LLM v3 extraction cron (4am UTC) + operator force-trigger.

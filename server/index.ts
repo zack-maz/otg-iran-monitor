@@ -19,6 +19,7 @@ import { eventsRouter } from './routes/events.js';
 import { flightsRouter } from './routes/flights.js';
 import { geocodeRouter } from './routes/geocode.js';
 import { healthRouter } from './routes/health.js';
+import { llmProbeCronRouter } from './routes/llm-probe-cron.js';
 import { marketsRouter } from './routes/markets.js';
 import { newsRouter } from './routes/news.js';
 import { operatorStatusRouter } from './routes/operator-status.js';
@@ -100,6 +101,7 @@ export function createApp() {
   // Phase 27.4.6 — daily LLM v3 extraction trigger. Mounts before the public
   // rate limiter so Vercel cron's once-daily invocation is not throttled.
   app.use('/api/cron/refresh-events', refreshEventsCronRouter);
+  app.use('/api/cron/llm-probe', llmProbeCronRouter);
 
   // Portfolio demo baseline rate limit — runs on every /api/* request
   // BEFORE the per-endpoint limiters below. 6 req/min per IP. Prevents
