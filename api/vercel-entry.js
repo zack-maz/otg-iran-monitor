@@ -2024,7 +2024,7 @@ function isAvailable(provider) {
 // server/lib/freeClaudeRouter.ts
 var NVIDIA_NIM_BASE = "https://integrate.api.nvidia.com/v1";
 var OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-var LLM_TIMEOUT_MS = 45e3;
+var LLM_TIMEOUT_MS = 9e4;
 var FATAL_STATUSES = /* @__PURE__ */ new Set([401, 403, 404, 410]);
 var RETRY_ATTEMPTS = 3;
 var BACKOFF_MS = [2e3, 8e3, 32e3];
@@ -2278,7 +2278,6 @@ async function callLLM(messages, _schemaText, opts = {}) {
           await sleepWithJitter(base);
           continue;
         }
-        if (bucket === "timeout" && attempt === 0) continue;
         callFailed = true;
         break;
       }
@@ -5382,7 +5381,8 @@ var LLM_PHASE_BUDGET_MS = 48e4;
 var GEOCODE_PHASE_BUDGET_MS = 66e4;
 var EVAL_START_BUDGET_MS = 54e4;
 function describeFatalStatus(status) {
-  if (status === 410) return "the model has been retired; probe a replacement (/api/cron/llm-probe)";
+  if (status === 410)
+    return "the model has been retired; probe a replacement (/api/cron/llm-probe)";
   if (status === 404) return "the model is not served to this key; probe a replacement";
   return "the NIM API key was rejected";
 }
@@ -5536,7 +5536,10 @@ async function runRefreshExtraction(opts) {
           return;
         }
         const prioritizedGroups = await prioritizeBySeverity(newGroups);
-        const waveSize = Math.max(BATCH_SIZE_ACTIVE, env.LLM_V3_CONCURRENCY * BATCH_SIZE_ACTIVE * 2);
+        const waveSize = Math.max(
+          BATCH_SIZE_ACTIVE,
+          env.LLM_V3_CONCURRENCY * BATCH_SIZE_ACTIVE * 2
+        );
         const llmDeadlineMs = cronStart + LLM_PHASE_BUDGET_MS;
         const geocodeDeadlineMs = cronStart + GEOCODE_PHASE_BUDGET_MS;
         const totalBatchesAll = Math.ceil(prioritizedGroups.length / BATCH_SIZE_ACTIVE);
@@ -5617,7 +5620,10 @@ async function runRefreshExtraction(opts) {
             });
           } catch (waveErr) {
             extractError = waveErr instanceof Error ? waveErr.message : String(waveErr);
-            log18.error({ err: extractError, wave: i / waveSize }, "LLM: a wave threw \u2014 ending the run");
+            log18.error(
+              { err: extractError, wave: i / waveSize },
+              "LLM: a wave threw \u2014 ending the run"
+            );
             break;
           }
           batchesDone += Math.ceil(wave.length / BATCH_SIZE_ACTIVE);

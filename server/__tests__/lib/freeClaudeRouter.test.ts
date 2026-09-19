@@ -459,27 +459,14 @@ describe('freeClaudeRouter — 401/403/404/410 are reported as fatalStatus and n
 });
 
 // ---------------------------------------------------------------------------
-// A hung request is retried once
+// A timed-out request is not retried
 // ---------------------------------------------------------------------------
 
-describe('freeClaudeRouter — a timeout is retried once, at once', () => {
-  it('timeout then success: two attempts with no backoff sleep between them', async () => {
-    vi.useFakeTimers();
-    createMock
-      .mockRejectedValueOnce(new Error('Request timed out.'))
-      .mockResolvedValueOnce(okResponse);
-
-    // No timers are advanced: a backoff sleep would leave this call pending.
-    const result = await callLLM([{ role: 'user', content: 'hi' }], '{}', {
-      skipOpenRouter: true,
-    });
-
-    expect(result.content).toBe('{"ok":true}');
-    expect(createMock).toHaveBeenCalledTimes(2);
-    expect(recordMock.mock.calls.filter(([, outcome]) => outcome === 'err')).toHaveLength(0);
-  });
-
-  it('a second timeout ends the call: two attempts, not three, and one breaker error', async () => {
+describe('freeClaudeRouter — a timeout ends the call without a retry', () => {
+  // Under a sustained run the model's latency tail reaches the timeout; an
+  // immediate retry doubled the load and lost more batches than it saved. The
+  // batch's groups stay out of the cache, so the next run takes them.
+  it('one attempt, null content, one breaker error, not fatal', async () => {
     createMock.mockRejectedValue(new Error('Request timed out.'));
 
     const result = await callLLM([{ role: 'user', content: 'hi' }], '{}', {
@@ -488,7 +475,7 @@ describe('freeClaudeRouter — a timeout is retried once, at once', () => {
 
     expect(result.content).toBeNull();
     expect(result.fatalStatus).toBeUndefined();
-    expect(createMock).toHaveBeenCalledTimes(2);
+    expect(createMock).toHaveBeenCalledTimes(1);
     expect(recordMock.mock.calls.filter(([, outcome]) => outcome === 'err')).toHaveLength(1);
   });
 });
@@ -501,7 +488,7 @@ describe('freeClaudeRouter — the router owns retries and the timeout', () => {
   // The SDK retries twice on its own by default. Hidden behind the 40/min
   // window that tripled the real request rate and stretched a failing call
   // past the batch watchdog.
-  it('both clients are built with maxRetries 0 and a 45 s timeout', async () => {
+  it('both clients are built with maxRetries 0 and a 90 s timeout', async () => {
     clientOptions.length = 0;
     createMock.mockResolvedValue(okResponse);
 
@@ -513,7 +500,7 @@ describe('freeClaudeRouter — the router owns retries and the timeout', () => {
     ]);
     for (const opts of clientOptions) {
       expect(opts.maxRetries).toBe(0);
-      expect(opts.timeout).toBe(45_000);
+      expect(opts.timeout).toBe(90_000);
     }
   });
 });

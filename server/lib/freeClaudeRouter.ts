@@ -92,11 +92,13 @@ export type RouterErrorBucket =
 
 export const NVIDIA_NIM_BASE = 'https://integrate.api.nvidia.com/v1';
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-// Per-request timeout. The production model answers a batch in ~15 s; a call
-// still open after 45 s is a hung connection, and a wave cannot finish until
-// its slowest batch does. One timed-out attempt is retried (see callLLM), so
-// the worst case stays under the 120 s batch watchdog.
-const LLM_TIMEOUT_MS = 45_000;
+// Per-request timeout. The production model answers a batch in ~15 s when
+// idle, but under a sustained run its tail reaches 45-90 s. Measured
+// 2026-09-19: at 45 s (with one retry) 23 of ~90 attempts were cut off and 6
+// batches lost; at 120 s, 1 batch in 64. 90 s keeps the slow calls and still
+// bounds how long one hung connection can hold up a wave. A timeout is not
+// retried: the batch's groups stay out of the cache, so the next run takes them.
+const LLM_TIMEOUT_MS = 90_000;
 
 // Phase 30 D-02 sanity-check tune (Run 1 baseline — Path B, no 429s):
 //   - Run 1 measured `throttleWindowMs.path = "B"` (NIM did NOT 429 during
@@ -622,8 +624,6 @@ export async function callLLM(
           await sleepWithJitter(base);
           continue;
         }
-        // A hung request is usually a one-off; retry it once, without backoff.
-        if (bucket === 'timeout' && attempt === 0) continue;
         // non-retriable or retry-exhausted -> mark call as failed, fall
         // through to next provider. Single 'err' record per call (not per
         // attempt) so a single rate-limit-then-retry-succeeds doesn't pollute
