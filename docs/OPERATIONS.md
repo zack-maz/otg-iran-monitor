@@ -3,12 +3,12 @@
 How to tell what is wrong with Iran Monitor, what each failure looks like, and how to fix it.
 System design lives in [ARCHITECTURE.md](./ARCHITECTURE.md); Redis keys in [redis-keys.md](./redis-keys.md); env vars in [`.env.example`](../.env.example); known open defects in [AUDIT-2026-09.md](./AUDIT-2026-09.md).
 
-**Production:** `https://otg-iran-monitor.vercel.app` · Vercel project `otg-iran-monitor` (Pro; one Express function, `maxDuration: 800`) · Upstash Redis (REST) · three daily crons from `vercel.json`: `/api/cron/health` 00:00 UTC, `/api/cron/refresh-events` 04:00, `/api/cron/warm` 12:00.
+**Production:** `https://motg-iran.vercel.app` · Vercel project `otg-iran-monitor` (Pro; one Express function, `maxDuration: 800`) · Upstash Redis (REST) · three daily crons from `vercel.json`: `/api/cron/health` 00:00 UTC, `/api/cron/refresh-events` 04:00, `/api/cron/warm` 12:00.
 
 **Secrets you need:** `DASHBOARD_PASSWORD` (operator Bearer for the dashboard and operator endpoints) and `CRON_SECRET` (Bearer for cron routes). Never paste either into a shared command or commit. Every Production env var is marked **Sensitive** in Vercel: it cannot be read back from the dashboard, and `vercel env pull` writes it as an empty string. If you have lost a value, rotate it — `vercel env rm X production --yes && printf '<new>' | vercel env add X production`, then `vercel redeploy <current prod URL>` (env changes only apply to new deployments). Rotating `CRON_SECRET` is safe: Vercel's scheduler injects the current value itself.
 
 ```bash
-export BASE=https://otg-iran-monitor.vercel.app
+export BASE=https://motg-iran.vercel.app
 export BEARER='<DASHBOARD_PASSWORD>'
 export CRON='<CRON_SECRET>'
 ```
@@ -198,7 +198,7 @@ Turning the LLM off on purpose: unset `NVIDIA_NIM_API_KEY`, redeploy. `/api/even
 
 ### 3.11 CORS errors
 
-- `CORS_ORIGIN` defaults to `*`. A wrong value is worse than none: preview URLs are dynamic. Leave it unset for Preview; for Production either unset or the exact origin. Verify: `curl -sI -H 'Origin: https://otg-iran-monitor.vercel.app' $BASE/api/health | grep -i access-control`.
+- `CORS_ORIGIN` defaults to `*`. A wrong value is worse than none: preview URLs are dynamic. Leave it unset for Preview; for Production either unset or the exact origin. Verify: `curl -sI -H 'Origin: https://motg-iran.vercel.app' $BASE/api/health | grep -i access-control`.
 
 ### 3.12 Every route 500 right after a deploy (env fail-fast)
 

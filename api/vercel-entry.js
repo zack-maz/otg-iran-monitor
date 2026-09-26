@@ -645,7 +645,7 @@ var IRAN_BBOX = {
 };
 var IRAN_CENTER = { lat: 28, lon: 45 };
 var ADSB_RADIUS_NM = 1200;
-var OUTBOUND_USER_AGENT = "otg-iran-monitor/1.0 (+https://otg-iran-monitor.vercel.app)";
+var OUTBOUND_USER_AGENT = "otg-iran-monitor/1.0 (+https://motg-iran.vercel.app)";
 var KNOTS_TO_MS = 0.514444;
 var FEET_TO_METERS = 0.3048;
 var FPM_TO_MS = 508e-5;
@@ -4887,7 +4887,7 @@ var PROBE_TIMEOUT_MS = 1e4;
 var PER_HOST_INTERVAL_MS = 1e3;
 var JITTER_MS2 = 200;
 var MAX_REDIRECTS = 3;
-var PROBE_UA = "IranMonitor-LinkCheck/1.0 (+https://otg-iran-monitor.vercel.app)";
+var PROBE_UA = "IranMonitor-LinkCheck/1.0 (+https://motg-iran.vercel.app)";
 var SOFT404_BODY_CAP_BYTES = 16384;
 var NEAR_EMPTY_FLOOR_BYTES = 512;
 var NOT_FOUND_MARKERS = [

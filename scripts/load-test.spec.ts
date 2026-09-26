@@ -13,7 +13,7 @@
 
 import { test, expect } from '@playwright/test';
 
-const PROD_URL = process.env.PROD_URL ?? 'https://otg-iran-monitor.vercel.app';
+const PROD_URL = process.env.PROD_URL ?? 'https://motg-iran.vercel.app';
 
 test.use({
   baseURL: PROD_URL,

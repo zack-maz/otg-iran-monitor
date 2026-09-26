@@ -4,7 +4,7 @@ Personal real-time intelligence dashboard for the Iran conflict: a 2.5D map (Map
 
 - **Frontend** `src/` — Vite, React 19, Zustand, Tailwind v4.
 - **Server** `server/` — one Express app (`createApp` in `server/index.ts`), bundled by tsup from `server/vercel-entry.ts` into a single Vercel function, `api/vercel-entry.js`.
-- **Cache** — Upstash Redis over REST. **Deploy** — Vercel Pro, project `otg-iran-monitor`, https://otg-iran-monitor.vercel.app.
+- **Cache** — Upstash Redis over REST. **Deploy** — Vercel Pro, project `otg-iran-monitor`, https://motg-iran.vercel.app.
 
 ## Where to look
 

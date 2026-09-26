@@ -15,7 +15,7 @@ import { Counter, Trend } from 'k6/metrics';
 // Configuration
 // ---------------------------------------------------------------------------
 
-const BASE_URL = __ENV.BASE_URL || 'https://otg-iran-monitor.vercel.app';
+const BASE_URL = __ENV.BASE_URL || 'https://motg-iran.vercel.app';
 
 // Custom metrics
 const rateLimited = new Counter('rate_limited');

@@ -449,10 +449,10 @@ async function main(): Promise<void> {
     );
     console.log('Env:');
     console.log(
-      '  SNAPSHOT_HEALTH_URL — overrides redis-mode /api/health URL (default: https://otg-iran-monitor.vercel.app/api/health).',
+      '  SNAPSHOT_HEALTH_URL — overrides redis-mode /api/health URL (default: https://motg-iran.vercel.app/api/health).',
     );
     console.log(
-      '  SNAPSHOT_BASE_URL   — overrides http-mode base URL (default: https://otg-iran-monitor.vercel.app).',
+      '  SNAPSHOT_BASE_URL   — overrides http-mode base URL (default: https://motg-iran.vercel.app).',
     );
     console.log('  DASHBOARD_PASSWORD  — Bearer used in http-mode for /api/events/llm-status.');
     process.exit(0);
@@ -466,9 +466,9 @@ async function main(): Promise<void> {
   const healthUrl =
     parseArg('health-url') ??
     process.env.SNAPSHOT_HEALTH_URL ??
-    'https://otg-iran-monitor.vercel.app/api/health';
+    'https://motg-iran.vercel.app/api/health';
   const baseUrl =
-    parseArg('base-url') ?? process.env.SNAPSHOT_BASE_URL ?? 'https://otg-iran-monitor.vercel.app';
+    parseArg('base-url') ?? process.env.SNAPSHOT_BASE_URL ?? 'https://motg-iran.vercel.app';
   const bearer = parseArg('bearer') ?? process.env.DASHBOARD_PASSWORD ?? '';
 
   const tickDate = tickDateArg ?? isoDate(new Date());

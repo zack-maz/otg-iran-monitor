@@ -9,8 +9,8 @@ the Greater Middle East. Numbers over narratives. It was built almost entirely
 through an agentic `/gsd` workflow, and this page walks you through both the
 product and how it got made.
 
-**Live demo:** [otg-iran-monitor.vercel.app](https://otg-iran-monitor.vercel.app)
-· hosted on `otg-iran-monitor.vercel.app` (the custom-domain decision was to stay
+**Live demo:** [motg-iran.vercel.app](https://motg-iran.vercel.app)
+· hosted on `motg-iran.vercel.app` (the custom-domain decision was to stay
 on the clean `vercel.app` origin — zero cost, zero DNS work).
 
 ![Hero](../public/screenshots/hero.gif)
@@ -29,7 +29,7 @@ operations to the build meta-story, and ends at the code itself.
 
 ### 1. The hero — what you're looking at
 
-Start at the [live demo](https://otg-iran-monitor.vercel.app) or the hero GIF
+Start at the [live demo](https://motg-iran.vercel.app) or the hero GIF
 above. The map fuses flights, ships, GDELT conflict events, OpenStreetMap
 infrastructure, news clusters, oil prices, weather, water stress, political
 alignment, and ethnic distribution — all live, all gated through one cache-first

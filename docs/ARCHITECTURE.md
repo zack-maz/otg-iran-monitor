@@ -191,7 +191,7 @@ Measured on NIM with `gemma-4-31b-it` (six production runs, 2026-09-19): ~15 s p
 
 ## 6. Vercel deployment
 
-- **Plan.** Vercel Pro, project `otg-iran-monitor`, `https://otg-iran-monitor.vercel.app`. `vercel.json` sets `maxDuration: 800` for `api/vercel-entry.js`; the platform default is 300 s and the extraction run exceeds it. This is the only reason for the paid plan. Do not lower it without redesigning the run.
+- **Plan.** Vercel Pro, project `otg-iran-monitor`, `https://motg-iran.vercel.app`. `vercel.json` sets `maxDuration: 800` for `api/vercel-entry.js`; the platform default is 300 s and the extraction run exceeds it. This is the only reason for the paid plan. Do not lower it without redesigning the run.
 - **Rewrites.** `/api/cron/*`, `/api/*` and `/health` → `/api/vercel-entry`; everything else → `/index.html`.
 
 | Cron (UTC)   | Route                      | Does                                                                                          | Auth                          |

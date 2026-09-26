@@ -222,7 +222,7 @@ const PROBE_TIMEOUT_MS = 10_000;
 const PER_HOST_INTERVAL_MS = 1_000;
 const JITTER_MS = 200;
 const MAX_REDIRECTS = 3;
-const PROBE_UA = 'IranMonitor-LinkCheck/1.0 (+https://otg-iran-monitor.vercel.app)';
+const PROBE_UA = 'IranMonitor-LinkCheck/1.0 (+https://motg-iran.vercel.app)';
 
 // ============================================================================
 // Phase 43 Plan 02 — soft-404 body heuristic constants (D-20, no env)

@@ -35,7 +35,7 @@
  *     DASHBOARD_PASSWORD=<secret> npx vitest run src/__tests__/rate-limit.test.ts
  *
  * To run against prod (CI workflow does this with secrets):
- *   API_BASE_URL=https://otg-iran-monitor.vercel.app RUN_RATE_LIMIT_TEST=1 \
+ *   API_BASE_URL=https://motg-iran.vercel.app RUN_RATE_LIMIT_TEST=1 \
  *     DASHBOARD_PASSWORD=<secret> npx vitest run src/__tests__/rate-limit.test.ts
  */
 // @vitest-environment node

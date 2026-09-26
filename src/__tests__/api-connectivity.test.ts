@@ -6,7 +6,7 @@
  *
  * Single suite, two environments — `API_BASE_URL` env var defaults to
  * `http://localhost:5173`. CI workflow at `.github/workflows/prod-connectivity-audit.yml`
- * sets `API_BASE_URL=https://otg-iran-monitor.vercel.app` from a GitHub
+ * sets `API_BASE_URL=https://motg-iran.vercel.app` from a GitHub
  * Actions secret for the prod-URL run (D-25 phase-close gate).
  *
  * Bearer is attached to every probe (D-30) — exercises Plan 02 Bearer-bypass
@@ -19,7 +19,7 @@
  *     DASHBOARD_PASSWORD=<secret> npx vitest run src/__tests__/api-connectivity.test.ts
  *
  * To run against prod (manual smoke):
- *   API_BASE_URL=https://otg-iran-monitor.vercel.app RUN_CONNECTIVITY_TEST=1 \
+ *   API_BASE_URL=https://motg-iran.vercel.app RUN_CONNECTIVITY_TEST=1 \
  *     DASHBOARD_PASSWORD=<secret> npx vitest run src/__tests__/api-connectivity.test.ts
  */
 // @vitest-environment node

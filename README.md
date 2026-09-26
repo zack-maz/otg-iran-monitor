@@ -6,7 +6,7 @@
 
 A personal open-source-intelligence tool that puts ten public data feeds on one 2.5D map of the Greater Middle East: flights, ships, conflict events, infrastructure, news, oil markets, weather, water stress, political alignment and ethnic distribution. Built to answer one question: _what is actually happening around the Strait of Hormuz right now, quantitatively?_
 
-**Live:** [otg-iran-monitor.vercel.app](https://otg-iran-monitor.vercel.app)
+**Live:** [motg-iran.vercel.app](https://motg-iran.vercel.app)
 
 > Please be gentle. This runs on free-tier upstreams and a single-user Redis budget. `/api/*` is rate-limited per IP and disallowed in `robots.txt`.
 

@@ -223,7 +223,7 @@ describe('Phase 32 Plan 02 Task 1 — probeUrl', () => {
       // Both the HEAD and the follow-up capped GET carry the UA.
       for (const call of fetchMock.mock.calls) {
         expect(call?.[1]?.headers?.['User-Agent']).toBe(
-          'IranMonitor-LinkCheck/1.0 (+https://otg-iran-monitor.vercel.app)',
+          'IranMonitor-LinkCheck/1.0 (+https://motg-iran.vercel.app)',
         );
       }
     });

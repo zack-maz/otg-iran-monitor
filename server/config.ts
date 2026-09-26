@@ -316,7 +316,7 @@ export const ADSB_RADIUS_NM = 1200;
  * blocklisted by some public APIs — adsb.lol began returning 403 for it, which
  * took /api/flights down in prod (2026-09). Always identify ourselves.
  */
-export const OUTBOUND_USER_AGENT = 'otg-iran-monitor/1.0 (+https://otg-iran-monitor.vercel.app)';
+export const OUTBOUND_USER_AGENT = 'otg-iran-monitor/1.0 (+https://motg-iran.vercel.app)';
 
 // Unit conversion constants (adsb.lol v2 API uses imperial units)
 export const KNOTS_TO_MS = 0.514444;

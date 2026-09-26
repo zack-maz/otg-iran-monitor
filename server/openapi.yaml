@@ -28,7 +28,7 @@ info:
     url: https://example.com/license
 
 servers:
-  - url: https://otg-iran-monitor.vercel.app
+  - url: https://motg-iran.vercel.app
     description: Production (Vercel serverless)
   - url: http://localhost:3001
     description: Local development

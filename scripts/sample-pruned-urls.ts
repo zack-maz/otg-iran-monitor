@@ -58,7 +58,7 @@ import type { UrlLiveness } from '../server/lib/urlLiveness.js';
 const BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
-const PROD_BASE = 'https://otg-iran-monitor.vercel.app';
+const PROD_BASE = 'https://motg-iran.vercel.app';
 const URL_LIVENESS_KEY_PREFIX = 'events:url-liveness:';
 const OPERATOR_AUDIT_KEY = 'operator:audit-log';
 const PROBE_TIMEOUT_MS = 10_000;

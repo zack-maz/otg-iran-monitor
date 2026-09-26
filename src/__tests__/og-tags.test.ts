@@ -15,7 +15,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const html = readFileSync(resolve(__dirname, '../../index.html'), 'utf8');
-const ABS = 'https://otg-iran-monitor.vercel.app';
+const ABS = 'https://motg-iran.vercel.app';
 
 describe('index.html OG / Twitter tags (REVEAL-SITE-03)', () => {
   it('has og:type / og:title / og:description / og:url', () => {

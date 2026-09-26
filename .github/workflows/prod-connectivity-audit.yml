@@ -25,7 +25,7 @@ on:
       target_url:
         description: 'Target URL (defaults to production)'
         required: false
-        default: 'https://otg-iran-monitor.vercel.app'
+        default: 'https://motg-iran.vercel.app'
 
 concurrency:
   group: prod-connectivity-audit-${{ github.ref }}
